@@ -103,6 +103,24 @@ class Log:
 LOG = Log(LOG_FILE)
 
 
+# ---------------------------------------------------------------- 进度回调
+# GUI 扫描时注入 hook：_prog(stage, pct, detail)
+# stage: 1~7 阶段号；pct: 本阶段内进度 0~1（<0 表示不定进度）；detail: 实时细节文本
+STAGE_NAMES = ["磁盘与程序", "清理点统计", "依赖目录", "大文件搜索",
+               "文件夹体积", "重复文件", "对比与报告"]
+STAGE_WEIGHTS = [0.05, 0.20, 0.15, 0.20, 0.15, 0.20, 0.05]
+PROGRESS_HOOK = None
+
+
+def _prog(stage, pct, detail=""):
+    h = PROGRESS_HOOK
+    if h:
+        try:
+            h(stage, pct, detail)
+        except Exception:
+            pass
+
+
 # ---------------------------------------------------------------- 工具函数
 def fmt_size(n):
     n = float(n or 0)
@@ -369,16 +387,20 @@ def scan_top_folders(drive_root, max_depth=4):
     return results
 
 
-def find_large_files(roots, min_bytes, max_depth=8, time_limit=None):
+def find_large_files(roots, min_bytes, max_depth=8, time_limit=None, on_progress=None):
     found = []
     deadline = time.time() + time_limit if time_limit else None
     skip_top = {"windows", "$recycle.bin", "system volume information", "$windows.~bt"}
+    tick = [0]
     for root in roots:
         stack = [(root, 0)]
         while stack:
             if deadline and time.time() > deadline:
                 return found
             path, depth = stack.pop()
+            tick[0] += 1
+            if on_progress and tick[0] % 40 == 0:
+                on_progress(path)
             try:
                 entries = os.scandir(path)
             except (PermissionError, FileNotFoundError, OSError):
@@ -405,17 +427,21 @@ def find_large_files(roots, min_bytes, max_depth=8, time_limit=None):
 
 
 # ---------------------------------------------------------------- 依赖目录扫描(node_modules 等)
-def scan_dependency_dirs(roots, time_limit=None):
+def scan_dependency_dirs(roots, time_limit=None, on_progress=None):
     """在 roots 下找 node_modules/venv/target/__pycache__ 等项目依赖目录并统计体积"""
     hits = []
     deadline = time.time() + time_limit if time_limit else None
     targets = DEPEND_DIR_NAMES
+    tick = [0]
     for root in roots:
         stack = [(root, 0)]
         while stack:
             if deadline and time.time() > deadline:
                 return hits
             path, depth = stack.pop()
+            tick[0] += 1
+            if on_progress and tick[0] % 40 == 0:
+                on_progress(path, len(hits))
             try:
                 entries = os.scandir(path)
             except (PermissionError, FileNotFoundError, OSError):
@@ -445,17 +471,21 @@ def scan_dependency_dirs(roots, time_limit=None):
 
 
 # ---------------------------------------------------------------- 重复文件检测
-def find_duplicates(roots, min_bytes, time_limit=None, max_groups=50):
+def find_duplicates(roots, min_bytes, time_limit=None, max_groups=50, on_progress=None):
     """按内容哈希找重复文件：先按(大小)分组，只对同尺寸文件做部分+完整哈希。
     返回重复组列表 [{size, files:[path...]}, ...]（保留每组第一个文件不动，其余为可删候选）"""
     if min_bytes <= 0:
         return []
     by_size = {}
     deadline = time.time() + time_limit if time_limit else None
+    tick = [0]
 
     def collect(path, st):
         if st.st_size >= min_bytes:
             by_size.setdefault(st.st_size, []).append(path)
+        tick[0] += 1
+        if on_progress and tick[0] % 300 == 0:
+            on_progress(path, len(by_size))
 
     for root in roots:
         scan_tree(root, max_depth=8, on_file=collect)
@@ -683,14 +713,18 @@ def run_scan(args, report_root):
 
     # 2) 已安装程序
     LOG("[1/7] 正在读取已安装程序清单 ...")
+    _prog(1, -1, "读取注册表与开始菜单 ...")
     progs = installed_programs()
     for p in progs:
         p["category"] = guess_program_category(p["name"], p["publisher"])
+    _prog(1, 1.0, "共 %d 个程序" % len(progs))
 
     # 3) 清理点
     LOG("[2/7] 正在统计各类缓存/清理点体积 ...")
     cleanups = []
-    for name, level, patterns, tip, cmd in cleanup_definitions():
+    defs = cleanup_definitions()
+    for i, (name, level, patterns, tip, cmd) in enumerate(defs):
+        _prog(2, i / max(1, len(defs)), name)
         paths = expand_paths(patterns)
         size = 0
         files = 0
@@ -710,11 +744,17 @@ def run_scan(args, report_root):
         cleanups.append({"name": name, "level": level, "size": size,
                          "files": files, "paths": paths, "tip": tip, "cmd": cmd})
         LOG("    %-28s %s" % (name, fmt_size(size)))
+    _prog(2, 1.0, "共 %d 个清理点" % len(cleanups))
 
     # 3b) 项目依赖目录(node_modules 等)
     LOG("[3/7] 正在扫描项目依赖目录(node_modules/venv/target) ...")
     dep_roots = [home] if not args.full else drives
-    dep_dirs = scan_dependency_dirs(dep_roots, time_limit=args.timeout)
+
+    def dep_prog(path, nhits):
+        _prog(3, -1, "%s ｜ 已找到 %d 个" % (path, nhits))
+
+    dep_dirs = scan_dependency_dirs(dep_roots, time_limit=args.timeout,
+                                    on_progress=dep_prog)
     dep_total = sum(d["size"] for d in dep_dirs)
     for c in cleanups:
         if c["name"].startswith("项目依赖目录"):
@@ -725,7 +765,13 @@ def run_scan(args, report_root):
     # 4) 大文件
     LOG("[4/7] 正在搜索大文件(>=%s) ..." % fmt_size(args.min_size))
     roots = drives if args.full else ([home] if IS_WIN else [home])
-    large = find_large_files(roots, args.min_size, max_depth=8, time_limit=args.timeout)
+
+    def big_prog(path):
+        _prog(4, -1, path)
+
+    large = find_large_files(roots, args.min_size, max_depth=8,
+                             time_limit=args.timeout, on_progress=big_prog)
+    _prog(4, 1.0, "找到 %d 个大文件" % len(large))
 
     # 5) 文件夹体积排行
     LOG("[5/7] 正在统计文件夹体积排行 ...")
@@ -733,22 +779,31 @@ def run_scan(args, report_root):
     scan_roots = ([r.strip() + ("\\" if not r.strip().endswith("\\") else "")
                    for r in args.drives.split(",") if r.strip()] if args.drives
                   else (drives if args.full else [home]))
-    for root in scan_roots:
+    for i, root in enumerate(scan_roots):
+        _prog(5, i / max(1, len(scan_roots)), root)
         LOG("    扫描 %s ..." % root)
         folder_rows.extend(scan_top_folders(root, max_depth=4))
+    _prog(5, 1.0, "完成")
 
     # 6) 重复文件
     dup_groups = []
     if not args.no_duplicates:
         LOG("[6/7] 正在检测重复文件(>=%s，按内容哈希) ..." % fmt_size(args.dup_min))
         dup_roots = drives if args.full else [home]
+
+        def dup_prog(path, nsizes):
+            _prog(6, -1, "%s ｜ %d 种尺寸" % (path, nsizes))
+
         dup_groups = find_duplicates(dup_roots, args.dup_min,
-                                     time_limit=args.timeout, max_groups=50)
+                                     time_limit=args.timeout, max_groups=50,
+                                     on_progress=dup_prog)
         wasted = sum(g["wasted"] for g in dup_groups)
         LOG("    找到 %d 组重复文件，可释放约 %s" % (len(dup_groups), fmt_size(wasted)))
+        _prog(6, 1.0, "%d 组重复，约 %s" % (len(dup_groups), fmt_size(wasted)))
 
     # 7) 历史对比
     LOG("[7/7] 正在与上次扫描结果对比 ...")
+    _prog(7, -1, "读取上次快照 ...")
     prev = load_last_snapshot(report_root)
     compare = diff_snapshot({"disks": disks, "cleanups": cleanups,
                              "folders": folder_rows, "generated":
@@ -1188,17 +1243,46 @@ def make_qr_png(url, png_path):
 # ---------------------------------------------------------------- 图形界面(无窗口模式)
 def run_gui(args, cfg, report_root):
     import tkinter as tk
-    from tkinter import ttk, font as tkfont
+    from tkinter import font as tkfont, filedialog
+
+    # ---------------- DPI 感知：高分辨率屏不模糊、不拉伸 ----------------
+    scale = 1.0
+    if IS_WIN:
+        try:
+            ctypes.windll.shcore.SetProcessDpiAwareness(2)  # PER_MONITOR_AWARE
+            scale = ctypes.windll.shcore.GetScaleFactorForDevice(0) / 100.0
+        except Exception:
+            try:
+                ctypes.windll.user32.SetProcessDPIAware()
+            except Exception:
+                pass
+    if scale <= 0 or scale > 3:
+        scale = 1.0
+
+    def S(v):
+        return int(round(v * scale))
+
+    # ---------------- 液态玻璃配色 ----------------
+    BG0 = "#0a0f1e"      # 深夜蓝底
+    CARD = "#161e38"     # 玻璃卡片
+    EDGE = "#2e3a63"     # 卡片描边
+    EDGE_HI = "#4a5a95"  # 顶部高光
+    TXT = "#e9eefb"
+    DIM = "#8d9abf"
+    ACCENT = "#6d7bff"   # 主强调（蓝紫）
+    CYAN = "#4dd6ff"     # 次强调（青）
+    GREEN = "#3ddc97"
+    RED = "#ff6b81"
 
     root = tk.Tk()
     root.title("电脑清理扫描器 · 只扫描不删除")
-    root.geometry("720x520")
-    root.minsize(640, 460)
+    root.geometry("%dx%d" % (S(880), S(680)))
+    root.minsize(S(820), S(620))
+    root.configure(bg=BG0)
     try:
-        # 用 exe 内嵌图标
-        import tempfile
-        root.iconbitmap(os.path.join(SCRIPT_DIR, "app-icon.ico")
-                        if os.path.exists(os.path.join(SCRIPT_DIR, "app-icon.ico")) else "")
+        ico = os.path.join(SCRIPT_DIR, "app-icon.ico")
+        if os.path.exists(ico):
+            root.iconbitmap(ico)
     except Exception:
         pass
 
@@ -1206,124 +1290,516 @@ def run_gui(args, cfg, report_root):
              "server": None, "url": None}
     logq = queue_mod.Queue()
 
-    style_h = tkfont.Font(root, size=13, weight="bold")
+    F_TITLE = tkfont.Font(root, family="Microsoft YaHei UI",
+                          size=S(18), weight="bold")
+    F_SUB = tkfont.Font(root, family="Microsoft YaHei UI", size=S(10))
+    F_UI = tkfont.Font(root, family="Microsoft YaHei UI", size=S(10))
+    F_UIB = tkfont.Font(root, family="Microsoft YaHei UI", size=S(10), weight="bold")
+    F_BTN = tkfont.Font(root, family="Microsoft YaHei UI", size=S(11), weight="bold")
+    F_STAGE = tkfont.Font(root, family="Microsoft YaHei UI", size=S(10), weight="bold")
+    F_DETAIL = tkfont.Font(root, family="Microsoft YaHei UI", size=S(9))
+    F_LOG = tkfont.Font(root, family="Consolas", size=S(9))
+    F_CHIP = tkfont.Font(root, family="Microsoft YaHei UI", size=S(8))
 
-    top = ttk.Frame(root, padding=14)
-    top.pack(fill="x")
-    ttk.Label(top, text="电脑清理扫描器", font=style_h).pack(side="left")
-    ttk.Label(top, text="  只扫描、只出报告，绝不删除文件", foreground="#6b7280").pack(side="left")
+    def round_pts(x1, y1, x2, y2, r):
+        return [x1 + r, y1, x2 - r, y1, x2, y1, x2, y1 + r, x2, y2 - r,
+                x2, y2, x2 - r, y2, x1 + r, y2, x1, y2, x1, y2 - r,
+                x1, y1 + r, x1, y1]
 
-    body = ttk.Frame(root, padding=(14, 0, 14, 8))
-    body.pack(fill="both", expand=True)
+    def shorten(s, n=52):
+        s = str(s)
+        return s if len(s) <= n else s[:n - 26] + "…" + s[-20:]
 
-    opts = ttk.Frame(body)
-    opts.pack(fill="x", pady=(0, 8))
+    # ---------------- 顶部 hero：渐变 + 液态光斑 ----------------
+    hero = tk.Canvas(root, height=S(96), bg=BG0, highlightthickness=0)
+    hero.pack(fill="x")
+
+    def draw_hero(e=None):
+        hero.delete("all")
+        w = max(hero.winfo_width(), S(300))
+        h = S(96)
+        n = 48
+        for i in range(n):
+            t = i / n
+            col = "#%02x%02x%02x" % (int(10 + 22 * t), int(15 + 26 * t), int(30 + 52 * t))
+            hero.create_rectangle(0, h * t, w, h * (t + 1.0 / n) + 1, fill=col, outline="")
+        for cx, cy, rx, ry, col in [(w * 0.88, S(8), S(180), S(62), "#26335f"),
+                                     (w * 0.04, h, S(210), S(74), "#1d2951"),
+                                     (w * 0.46, -S(6), S(160), S(52), "#1b2547")]:
+            hero.create_oval(cx - rx, cy - ry, cx + rx, cy + ry, fill=col,
+                             outline="", stipple="gray50")
+        hero.create_text(S(28), S(36), anchor="w", text="电脑清理扫描器",
+                         font=F_TITLE, fill=TXT)
+        hero.create_text(S(30), S(68), anchor="w",
+                         text="只扫描、只出报告，绝不删除 · 报告位置可切换 · 实时进度",
+                         font=F_SUB, fill=DIM)
+    hero.bind("<Configure>", draw_hero)
+
+
+    # ---------------- 玻璃卡片 ----------------
+    class Card(tk.Frame):
+        def __init__(self, master):
+            super().__init__(master, bg=BG0)
+            self.cv = tk.Canvas(self, bg=BG0, highlightthickness=0)
+            self.cv.pack(fill="both", expand=True)
+            self.cv.bind("<Configure>", lambda e: self._redraw())
+
+        def _redraw(self):
+            self.cv.delete("card")
+            w = self.cv.winfo_width()
+            h = self.cv.winfo_height()
+            if w < 30 or h < 24:
+                return
+            self.cv.create_polygon(round_pts(1, 1, w - 2, h - 2, S(16)), smooth=True,
+                                   fill=CARD, outline=EDGE, width=1, tags="card")
+            self.cv.create_line(S(18), 2.5, w - S(18), 2.5, fill=EDGE_HI, width=1, tags="card")
+            self.cv.tag_lower("card")
+
+    # ---------------- 玻璃按钮 ----------------
+    class GButton(tk.Canvas):
+        def __init__(self, master, text, cmd, kind="ghost", width=None):
+            h = S(46) if kind == "primary" else S(34)
+            self._kind = kind
+            self._cmd = cmd
+            self._t = text
+            self._hov = False
+            self._en = True
+            self._cw = width or (S(34) + int(len(text) * S(15)))
+            super().__init__(master, height=h, width=self._cw, bg=BG0,
+                             highlightthickness=0, cursor="hand2")
+            self.bind("<Button-1>", lambda e: self._click())
+            self.bind("<Enter>", lambda e: self._enter(True))
+            self.bind("<Leave>", lambda e: self._enter(False))
+            self.redraw()
+
+        def _click(self):
+            if self._en:
+                try:
+                    self._cmd()
+                except Exception:
+                    pass
+
+        def _enter(self, v):
+            self._hov = v
+            self.redraw()
+
+        def set_enabled(self, en):
+            self._en = en
+            self.redraw()
+
+        def redraw(self):
+            self.delete("all")
+            w = self._cw
+            h = int(self["height"])
+            r = h // 2
+            if self._kind == "primary":
+                if not self._en:
+                    fill, tc = "#3a4166", "#9aa3c8"
+                elif self._hov:
+                    fill, tc = "#8089ff", "#ffffff"
+                else:
+                    fill, tc = ACCENT, "#ffffff"
+                self.create_polygon(round_pts(1, 1, w - 2, h - 2, r), smooth=True,
+                                    fill=fill, outline="")
+                if self._en:
+                    self.create_line(S(16), S(4), w - S(16), S(4), fill="#aab2ff", width=1)
+                self.create_text(w / 2, h / 2 + 1, text=self._t, font=F_BTN, fill=tc)
+            else:
+                fill = "#263257" if self._hov else "#1c2647"
+                tc = TXT if self._en else "#7f89ad"
+                self.create_polygon(round_pts(1, 1, w - 2, h - 2, r), smooth=True,
+                                    fill=fill, outline=EDGE)
+                self.create_text(w / 2, h / 2 + 1, text=self._t, font=F_UIB, fill=tc)
+
+    # ---------------- 开关药丸 ----------------
+    class Toggle(tk.Canvas):
+        def __init__(self, master, text, var, width=200):
+            self._t = text
+            self._v = var
+            self._cw = width
+            super().__init__(master, height=S(34), width=width, bg=CARD,
+                             highlightthickness=0, cursor="hand2")
+            self.bind("<Button-1>", lambda e: self._v.set(not self._v.get()))
+            self._v.trace_add("write", lambda *a: self.redraw())
+            self.redraw()
+
+        def redraw(self):
+            self.delete("all")
+            w = self._cw
+            h = S(34)
+            on = self._v.get()
+            fill = "#232e6e" if on else "#121a33"
+            edge = ACCENT if on else "#28325a"
+            self.create_polygon(round_pts(1, 1, w - 2, h - 2, h // 2), smooth=True,
+                                fill=fill, outline=edge)
+            self.create_text(16, h / 2 + 1, anchor="w", text=self._t, font=F_UI,
+                             fill=TXT if on else DIM)
+            x0 = w - S(44)
+            y0 = h / 2 - S(8)
+            self.create_polygon(round_pts(x0, y0, x0 + S(32), y0 + S(16), S(8)), smooth=True,
+                                fill="#0d1428", outline=edge)
+            kx = x0 + S(24) if on else x0 + S(9)
+            self.create_oval(kx - S(6), y0 + S(2), kx + S(6), y0 + S(14),
+                             fill=ACCENT if on else "#3a4a80", outline="")
+
+    # ---------------- 进度条（渐变 + 流光） ----------------
+    class ProgBar(tk.Canvas):
+        def __init__(self, master):
+            super().__init__(master, height=S(18), bg=CARD, highlightthickness=0)
+            self.pct = 0.0
+            self.indet = False
+            self.phase = 0.0
+            self.bind("<Configure>", lambda e: self.redraw())
+
+        def set(self, pct, indet=False):
+            self.pct = pct
+            self.indet = indet
+            self.redraw()
+
+        def tick(self):
+            if self.indet:
+                self.phase = (self.phase + 0.02) % 1.0
+                self.redraw()
+
+        def redraw(self):
+            self.delete("all")
+            w = self.winfo_width()
+            h = S(18)
+            if w < S(30):
+                return
+            self.create_polygon(round_pts(1, 1, w - 2, h - 2, S(9)), smooth=True,
+                                fill="#0d1428", outline=EDGE)
+            fw = int((w - S(8)) * max(0.0, min(1.0, self.pct)))
+            if fw > 12:
+                self.create_polygon(round_pts(S(4), S(4), S(4) + fw, h - S(4), S(8)), smooth=True,
+                                    fill=ACCENT, outline="")
+                self.create_line(S(10), S(6), S(4) + fw - S(8), S(6), fill="#9aa5ff", width=1)
+                if self.indet:
+                    span = min(S(50), max(S(24), fw // 3))
+                    x = S(6) + max(0, fw - span - S(4)) * self.phase
+                    self.create_polygon(round_pts(x, S(4), x + span, h - S(4), S(7)),
+                                        smooth=True, fill="#aeb8ff", outline="",
+                                        stipple="gray50")
+
+    # ---------------- 阶段指示（7 步） ----------------
+    CHIP_NAMES = ["磁盘", "清理点", "依赖", "大文件", "文件夹", "重复", "报告"]
+
+    class StageChips(tk.Canvas):
+        def __init__(self, master):
+            super().__init__(master, height=S(48), bg=CARD, highlightthickness=0)
+            self.active = 0
+            self.done = set()
+            self.bind("<Configure>", lambda e: self.redraw())
+
+        def set(self, stage, pct):
+            for k in range(1, stage):
+                self.done.add(k)
+            if pct >= 1.0:
+                self.done.add(stage)
+                if self.active == stage:
+                    self.active = 0
+            else:
+                self.active = stage
+            self.redraw()
+
+        def all_done(self):
+            self.done = set(range(1, 8))
+            self.active = 0
+            self.redraw()
+
+        def reset(self):
+            self.done = set()
+            self.active = 0
+            self.redraw()
+
+        def redraw(self):
+            self.delete("all")
+            w = self.winfo_width()
+            if w < S(140):
+                return
+            cw = w / 7.0
+            for i in range(7):
+                x1 = i * cw + S(5)
+                x2 = (i + 1) * cw - S(5)
+                st = i + 1
+                if st in self.done:
+                    fill, edge, tc = "#11322a", "#1f7a5c", GREEN
+                elif st == self.active:
+                    fill, edge, tc = "#232e6e", ACCENT, TXT
+                else:
+                    fill, edge, tc = "#121a33", "#28325a", DIM
+                self.create_polygon(round_pts(x1, S(4), x2, S(44), S(10)), smooth=True,
+                                    fill=fill, outline=edge)
+                self.create_text((x1 + x2) / 2, S(15),
+                                 text=("✓" if st in self.done else str(st)),
+                                 font=F_CHIP, fill=tc)
+                self.create_text((x1 + x2) / 2, S(31), text=CHIP_NAMES[i],
+                                 font=F_CHIP, fill=tc)
+
+    # ---------------- 布局 ----------------
+    content = tk.Frame(root, bg=BG0)
+    content.pack(fill="both", expand=True, padx=S(20), pady=(S(12), S(4)))
+
+    # 选项卡
+    opt_card = Card(content)
+    opt_card.pack(fill="x")
+    opt_card.pack_propagate(False)
+    opt_card.configure(height=S(58))
     full_var = tk.BooleanVar(value=False)
     dup_var = tk.BooleanVar(value=True)
-    ttk.Checkbutton(opts, text="全盘扫描(所有硬盘，较慢)", variable=full_var).pack(side="left")
-    ttk.Checkbutton(opts, text="检测重复文件", variable=dup_var).pack(side="left", padx=12)
-    ttk.Label(opts, text="报告位置:", foreground="#6b7280").pack(side="left", padx=(16, 4))
-    dir_label = ttk.Label(opts, text=report_root, foreground="#2563eb", cursor="hand2")
-    dir_label.pack(side="left")
+    Toggle(opt_card, "全盘扫描（所有硬盘，较慢）", full_var, width=S(210)).place(
+        relx=0.025, rely=0.5, anchor="w")
+    Toggle(opt_card, "检测重复文件", dup_var, width=S(150)).place(
+        relx=0.46, rely=0.5, anchor="w")
+    tk.Label(opt_card, text="默认只扫用户目录，更快", font=F_DETAIL,
+             bg=CARD, fg=DIM).place(relx=0.975, rely=0.5, anchor="e")
 
-    log_box = tk.Text(body, height=16, state="disabled", wrap="none",
-                      font=("Consolas", 10), background="#0f172a", foreground="#e2e8f0")
-    log_box.pack(fill="both", expand=True)
+    # 报告位置卡（点击打开 / 可切换 / 记住上次）
+    dir_card = Card(content)
+    dir_card.pack(fill="x", pady=(S(10), 0))
+    dir_card.pack_propagate(False)
+    dir_card.configure(height=S(58))
+    path_state = {"dir": report_root}
 
-    bottom = ttk.Frame(root, padding=(14, 4, 14, 14))
-    bottom.pack(fill="x")
-    scan_btn = ttk.Button(bottom, text="▶ 开始扫描")
+    icocv = tk.Canvas(dir_card, width=S(34), height=S(34), bg=CARD,
+                      highlightthickness=0, cursor="hand2")
+    icocv.place(relx=0.03, rely=0.5, anchor="w")
+
+    def draw_folder_icon():
+        icocv.delete("all")
+        icocv.create_polygon(round_pts(S(2), S(10), S(32), S(32), S(6)), smooth=True,
+                             fill="#3d4c85", outline="#5a6bb0")
+        icocv.create_rectangle(S(2), S(4), S(13), S(9), fill="#4a5a95", outline="#5a6bb0")
+        icocv.create_line(S(8), S(18), S(26), S(18), fill="#8fa0d8", width=S(2))
+        icocv.create_line(S(8), S(24), S(21), S(24), fill="#7284c4", width=S(2))
+    draw_folder_icon()
+
+    def open_report_dir(_e=None):
+        d = path_state["dir"]
+        try:
+            os.makedirs(d, exist_ok=True)
+            os.startfile(d)
+        except Exception as ex:
+            append_log("打开文件夹失败：%s" % ex)
+
+    def choose_report_dir():
+        d = filedialog.askdirectory(initialdir=path_state["dir"],
+                                    title="选择报告保存位置")
+        if not d:
+            return
+        try:
+            os.makedirs(d, exist_ok=True)
+            probe = os.path.join(d, ".wtest")
+            open(probe, "w").close()
+            os.remove(probe)
+        except OSError as ex:
+            append_log("该位置不可写，换一个试试：%s" % ex)
+            return
+        path_state["dir"] = d
+        cfg["report_dir"] = d
+        try:
+            save_config(cfg)
+            append_log("✔ 已记住新的报告位置（下次打开自动使用）：%s" % d)
+        except Exception:
+            append_log("报告位置已切换为 %s（写入配置失败）" % d)
+        refresh_dir_label()
+
+    dir_lbl = tk.Label(dir_card, text="", font=F_UIB, bg=CARD, fg=CYAN,
+                       cursor="hand2", anchor="w", justify="left")
+    dir_lbl.place(relx=0.10, rely=0.5, anchor="w", relwidth=0.62)
+    dir_lbl.bind("<Button-1>", open_report_dir)
+    icocv.bind("<Button-1>", open_report_dir)
+    tip_lbl = tk.Label(dir_card, text="点击路径打开文件夹", font=F_DETAIL,
+                       bg=CARD, fg=DIM)
+    tip_lbl.place(relx=0.74, rely=0.5, anchor="w")
+
+    def refresh_dir_label():
+        dir_lbl.configure(text=shorten(path_state["dir"], 52))
+    refresh_dir_label()
+
+    dir_btn = GButton(dir_card, "切换位置", choose_report_dir, width=S(104))
+    dir_btn.place(relx=0.985, rely=0.5, anchor="e")
+
+    # 进度卡
+    prog_card = Card(content)
+    prog_card.pack(fill="x", pady=(S(10), 0))
+    prog_card.pack_propagate(False)
+    prog_card.configure(height=S(150))
+    chips = StageChips(prog_card)
+    chips.place(relx=0.02, rely=0.04, relwidth=0.96)
+    pct_lbl = tk.Label(prog_card, text="0%", font=F_UIB, bg=CARD, fg=TXT)
+    pct_lbl.place(relx=0.98, rely=0.44, anchor="e")
+    bar = ProgBar(prog_card)
+    bar.place(relx=0.02, rely=0.44, relwidth=0.84, height=S(18))
+    stage_lbl = tk.Label(prog_card, text="就绪 · 点击「开始扫描」", font=F_STAGE,
+                         bg=CARD, fg=TXT, anchor="w")
+    stage_lbl.place(relx=0.02, rely=0.71, anchor="w")
+    time_lbl = tk.Label(prog_card, text="耗时 --:--", font=F_UIB, bg=CARD, fg=CYAN)
+    time_lbl.place(relx=0.98, rely=0.71, anchor="e")
+    detail_lbl = tk.Label(prog_card, text="支持 7 个阶段实时进度", font=F_DETAIL,
+                          bg=CARD, fg=DIM, anchor="w", justify="left")
+    detail_lbl.place(relx=0.02, rely=0.93, anchor="sw", relwidth=0.96)
+
+    # 日志卡
+    log_card = Card(content)
+    log_card.pack(fill="both", expand=True, pady=(S(10), 0))
+    log_card.pack_propagate(False)
+    log_box = tk.Text(log_card, state="disabled", wrap="none", font=F_LOG,
+                      bg="#0d1326", fg="#c9d4f0", bd=0, padx=10, pady=8,
+                      insertbackground=TXT, selectbackground="#2c3d8f")
+    log_box.place(relx=0.015, rely=0.07, relwidth=0.94, relheight=0.86)
+    lsb = tk.Scrollbar(log_card, command=log_box.yview, bd=0,
+                       highlightthickness=0, bg=CARD, troughcolor="#0d1326")
+    log_box.configure(yscrollcommand=lsb.set)
+    lsb.place(relx=0.982, rely=0.07, relheight=0.86, anchor="ne")
+
+    # 底栏
+    bottom = tk.Frame(root, bg=BG0)
+    bottom.pack(fill="x", padx=S(20), pady=(S(10), S(14)))
+    status_lbl = tk.Label(bottom, text="就绪", font=F_UIB, bg=BG0, fg=DIM)
+    status_lbl.pack(side="right")
+
+    scan_btn = GButton(bottom, "开始扫描", None, kind="primary")
     scan_btn.pack(side="left")
-    open_btn = ttk.Button(bottom, text="打开报告")
-    phone_btn = ttk.Button(bottom, text="手机扫码查看")
-    state_label = ttk.Label(bottom, text="就绪", foreground="#6b7280")
-    state_label.pack(side="right")
-    open_btn.pack_forget()
-    phone_btn.pack_forget()
+    open_btn = GButton(bottom, "打开报告", None, width=S(104))
+    open_btn.pack(side="left", padx=(S(14), 0))
+    open_btn.set_enabled(False)
+    phone_btn = GButton(bottom, "手机查看", None, width=S(104))
+    phone_btn.pack(side="left", padx=(S(14), 0))
+    phone_btn.set_enabled(False)
 
     def append_log(msg):
         log_box.configure(state="normal")
         log_box.insert("end", msg + "\n")
         log_box.see("end")
         log_box.configure(state="disabled")
-        root.update_idletasks()
 
     class GuiLog:
         def __call__(self, msg):
             line = "[%s] %s" % (datetime.now().strftime("%H:%M:%S"), msg)
-            logq.put(line)
+            logq.put(("log", line))
 
-    def poll_log():
-        while True:
-            try:
-                line = logq.get_nowait()
-            except queue_mod.Empty:
-                break
-            append_log(line)
-        root.after(200, poll_log)
+    def fmt_ms(sec):
+        return "%d:%02d" % (int(sec) // 60, int(sec) % 60)
 
     def do_scan():
         if state["scanning"]:
             return
         state["scanning"] = True
-        scan_btn.configure(state="disabled")
-        open_btn.pack_forget()
-        phone_btn.pack_forget()
+        state["t0"] = time.time()
+        scan_btn.set_enabled(False)
+        open_btn.set_enabled(False)
+        phone_btn.set_enabled(False)
+        chips.reset()
+        bar.set(0.0)
+        pct_lbl.configure(text="0%")
+        detail_lbl.configure(text="")
+        stage_lbl.configure(text="准备中 …")
+        status_lbl.configure(text="扫描中…", fg="#ffc35c")
         log_box.configure(state="normal")
         log_box.delete("1.0", "end")
         log_box.configure(state="disabled")
-        state_label.configure(text="扫描中……", foreground="#d97706")
-        global LOG
+        global LOG, PROGRESS_HOOK
         old_log = LOG
         LOG = GuiLog()
+
+        def hook(stage, pct, detail):
+            logq.put(("prog", (stage, pct, detail)))
+
+        PROGRESS_HOOK = hook
 
         def work():
             try:
                 a = argparse.Namespace(
                     full=full_var.get(), drives="", min_size=100 * 2**20,
                     dup_min=10 * 2**20, no_duplicates=not dup_var.get(),
-                    timeout=600, no_open=True, report_dir="",
+                    timeout=900, no_open=True, report_dir="",
                     set_report_dir="", reset_report_dir=False)
-                data = run_scan(a, report_root)
+                rroot = path_state["dir"]
+                data = run_scan(a, rroot)
                 stamp = datetime.now().strftime("%Y%m%d_%H%M")
-                outdir = os.path.join(report_root, stamp)
+                outdir = os.path.join(rroot, stamp)
                 os.makedirs(outdir, exist_ok=True)
+                logq.put(("prog", (7, 0.6, "正在写出 CSV / JSON / HTML 报告 …")))
                 write_csvs(data, outdir)
                 write_summary(data, outdir)
                 html = write_html(data, outdir)
                 a_total = sum(c["size"] for c in data["cleanups"] if c["level"] == "A")
-                LOG("✔ 扫描完成！报告：%s" % outdir)
+                b_total = sum(c["size"] for c in data["cleanups"] if c["level"] == "B")
+                LOG("✔ 扫描完成！报告目录：%s" % outdir)
                 LOG("小结：A 级可放心清理约 %s，确认后可清理的 B 级约 %s。"
-                    % (fmt_size(a_total),
-                       fmt_size(sum(c["size"] for c in data["cleanups"] if c["level"] == "B"))))
-                state["outdir"] = outdir
-                state["html"] = html
-                logq.put("__DONE__")
+                    % (fmt_size(a_total), fmt_size(b_total)))
+                if data.get("duplicates"):
+                    LOG("      另发现重复文件 %d 组，重复占用约 %s。" % (
+                        len(data["duplicates"]),
+                        fmt_size(sum(g["wasted"] for g in data["duplicates"]))))
+                logq.put(("done", (outdir, html)))
             except Exception as e:
-                logq.put("__ERROR__%s" % e)
+                logq.put(("error", "%s: %s" % (type(e).__name__, e)))
             finally:
                 LOG = old_log
+                PROGRESS_HOOK = None
 
         threading.Thread(target=work, daemon=True).start()
 
-    def poll_done():
+    def overall_pct(stage, pct):
+        base = sum(STAGE_WEIGHTS[:stage - 1])
+        w = STAGE_WEIGHTS[stage - 1]
+        if pct < 0:
+            return base + w * 0.55
+        return base + w * max(0.0, min(1.0, pct))
+
+    def poll_msg():
         try:
-            msg = logq.get_nowait()
+            while True:
+                kind, payload = logq.get_nowait()
+                if kind == "log":
+                    append_log(payload)
+                elif kind == "prog":
+                    stage, pct, detail = payload
+                    chips.set(stage, pct)
+                    op = overall_pct(stage, pct)
+                    bar.set(op, indet=(pct < 0))
+                    pct_lbl.configure(text="%d%%" % int(op * 100))
+                    stage_lbl.configure(
+                        text="阶段 %d/7 · %s" % (stage, STAGE_NAMES[stage - 1]))
+                    detail_lbl.configure(
+                        text=shorten(detail, 76) if detail else "")
+                elif kind == "done":
+                    outdir, html = payload
+                    state["outdir"] = outdir
+                    state["html"] = html
+                    state["scanning"] = False
+                    chips.all_done()
+                    bar.set(1.0)
+                    pct_lbl.configure(text="100%")
+                    stage_lbl.configure(text="全部完成 ✓")
+                    detail_lbl.configure(text="报告：%s" % shorten(outdir, 64))
+                    if "t0" in state:
+                        time_lbl.configure(
+                            text="耗时 %s" % fmt_ms(time.time() - state["t0"]))
+                    status_lbl.configure(text="完成 ✓", fg=GREEN)
+                    scan_btn.set_enabled(True)
+                    open_btn.set_enabled(True)
+                    phone_btn.set_enabled(True)
+                elif kind == "error":
+                    state["scanning"] = False
+                    scan_btn.set_enabled(True)
+                    status_lbl.configure(text="出错", fg=RED)
+                    stage_lbl.configure(text="扫描失败")
+                    detail_lbl.configure(text=str(payload)[:80])
+                    append_log("扫描失败：%s" % payload)
         except queue_mod.Empty:
-            root.after(300, poll_done)
-            return
-        if msg == "__DONE__":
-            state["scanning"] = False
-            scan_btn.configure(state="normal")
-            open_btn.pack(side="left", padx=8)
-            phone_btn.pack(side="left")
-            state_label.configure(text="完成 ✓", foreground="#16a34a")
-        elif msg.startswith("__ERROR__"):
-            state["scanning"] = False
-            scan_btn.configure(state="normal")
-            state_label.configure(text="出错", foreground="#dc2626")
-            append_log("扫描失败：%s" % msg[9:])
-        root.after(300, poll_done)
+            pass
+        root.after(150, poll_msg)
+
+    def on_tick():
+        if state["scanning"]:
+            bar.tick()
+            if "t0" in state:
+                time_lbl.configure(
+                    text="耗时 %s" % fmt_ms(time.time() - state["t0"]))
+        root.after(120, on_tick)
 
     def open_report():
         if state["html"]:
@@ -1342,22 +1818,45 @@ def run_gui(args, cfg, report_root):
     def show_qr_window(url):
         win = tk.Toplevel(root)
         win.title("手机查看报告")
-        win.geometry("360x420")
-        ttk.Label(win, text="手机和电脑连同一 WiFi，扫码或输入网址：",
-                  padding=10).pack()
-        ttk.Label(win, text=url, foreground="#2563eb",
-                  font=("Consolas", 10)).pack()
+        win.geometry("%dx%d" % (S(380), S(480)))
+        win.configure(bg=BG0)
+        try:
+            ico = os.path.join(SCRIPT_DIR, "app-icon.ico")
+            if os.path.exists(ico):
+                win.iconbitmap(ico)
+        except Exception:
+            pass
+        hd = tk.Canvas(win, height=S(60), bg=BG0, highlightthickness=0)
+        hd.pack(fill="x")
+
+        def draw_hd(e=None):
+            hd.delete("all")
+            w = max(hd.winfo_width(), 200)
+            for i in range(30):
+                t = i / 30
+                hd.create_rectangle(0, S(60) * t, w, S(60) * (t + 1 / 30) + 1,
+                                    fill="#%02x%02x%02x" % (int(10 + 22 * t),
+                                                            int(15 + 26 * t),
+                                                            int(30 + 52 * t)),
+                                    outline="")
+            hd.create_text(S(20), S(30), anchor="w", text="手机扫码查看报告",
+                           font=F_UIB, fill=TXT)
+        hd.bind("<Configure>", draw_hd)
+
+        tk.Label(win, text="手机和电脑连同一 WiFi，扫码或输入网址：",
+                 font=F_UI, bg=BG0, fg=DIM).pack(pady=(12, 4))
+        tk.Label(win, text=url, font=("Consolas", S(10)), bg=BG0, fg=CYAN).pack()
         png = os.path.join(state["outdir"], "_qr.png")
         if make_qr_png(url, png):
             img = tk.PhotoImage(file=png)
-            lbl = ttk.Label(win, image=img)
+            lbl = tk.Label(win, image=img, bg=BG0)
             lbl.image = img
-            lbl.pack(pady=8)
+            lbl.pack(pady=10)
         else:
-            ttk.Label(win, text="(未安装二维码组件，请手动输入上面的网址)",
-                      foreground="#6b7280").pack()
-        ttk.Label(win, text="关闭本窗口后服务继续运行，退出程序时自动停止",
-                  foreground="#6b7280").pack(side="bottom", pady=8)
+            tk.Label(win, text="(未安装二维码组件，请手动输入上面的网址)",
+                     font=F_DETAIL, bg=BG0, fg=DIM).pack(pady=10)
+        tk.Label(win, text="关闭本窗口后服务继续运行，退出程序时自动停止",
+                 font=F_DETAIL, bg=BG0, fg=DIM).pack(side="bottom", pady=10)
 
     def on_close():
         if state["server"]:
@@ -1367,14 +1866,16 @@ def run_gui(args, cfg, report_root):
                 pass
         root.destroy()
 
-    scan_btn.configure(command=do_scan)
-    open_btn.configure(command=open_report)
-    phone_btn.configure(command=phone_view)
+    scan_btn._cmd = do_scan
+    open_btn._cmd = open_report
+    phone_btn._cmd = phone_view
     root.protocol("WM_DELETE_WINDOW", on_close)
-    append_log("欢迎使用！点击「开始扫描」即可。")
-    append_log("报告将保存到：%s" % report_root)
-    poll_log()
-    poll_done()
+    append_log("欢迎使用电脑清理扫描器 v2.1 —— 只扫描、只出报告，绝不删除。")
+    append_log("报告保存位置：%s（点击上方路径可打开文件夹，可「切换位置」）"
+               % path_state["dir"])
+    append_log("点击「开始扫描」开始，扫描过程中可实时观察 7 个阶段的进度。")
+    poll_msg()
+    on_tick()
     root.mainloop()
 
 

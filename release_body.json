@@ -1,0 +1,8 @@
+{
+  "tag_name": "v2.0.0",
+  "target_commitish": "main",
+  "name": "v2.0.0 电脑清理扫描器",
+  "body": "只扫描、只出报告、绝不自动删除的 Windows 清理辅助工具。\n\n## 主要功能\n- 29 个清理点扫描（浏览器缓存、Docker、WSL、微信/QQ、开发缓存等），A/B/C 三级安全分类\n- 大文件、重复文件（双重哈希校验）、依赖目录（node_modules 等）扫描\n- 已安装程序清单 + 历史扫描对比\n- HTML 交互式报告 + CSV 明细，支持勾选导出 PowerShell 清理脚本（移入回收站，非永久删除）\n- GUI 单文件 exe，双击即用，免 Python 环境，无控制台黑框\n- 手机同 WiFi 扫码查看报告\n\n## 下载\n下载下方 电脑清理扫描器.exe，双击即可运行（Windows 10/11）。\n\n## 使用说明\n详见仓库 使用说明.md。",
+  "draft": false,
+  "prerelease": false
+}
