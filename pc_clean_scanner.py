@@ -61,7 +61,7 @@ DEFAULT_REPORT_DIR = os.path.join(SCRIPT_DIR, "scan_reports")
 LOG_FILE = os.path.join(SCRIPT_DIR, "扫描日志.log")
 
 FILE_ATTRIBUTE_REPARSE_POINT = 0x400
-APP_VERSION = "2.2.1"
+APP_VERSION = "2.2.2"
 GITHUB_REPO = "UltraSkyShow321/pc-clean-scanner"
 RELEASES_URL = "https://github.com/%s/releases" % GITHUB_REPO
 LEVEL_INFO = {
@@ -2179,9 +2179,12 @@ def run_gui(args, cfg, report_root):
     dir_card.configure(height=S(58))
     path_state = {"dir": report_root}
 
-    icocv = tk.Canvas(dir_card, width=S(34), height=S(34), bg=CARD,
+    # 单行内容条：层内 pack 排列，结构上不可能重叠
+    dir_row = tk.Frame(dir_card, bg=CARD)
+    dir_row.place(relx=0.02, rely=0.0, relwidth=0.96, relheight=1.0)
+
+    icocv = tk.Canvas(dir_row, width=S(34), height=S(34), bg=CARD,
                       highlightthickness=0, cursor="hand2")
-    icocv.place(relx=0.03, rely=0.5, anchor="w")
 
     def draw_folder_icon():
         icocv.delete("all")
@@ -2222,41 +2225,53 @@ def run_gui(args, cfg, report_root):
             append_log("报告位置已切换为 %s（写入配置失败）" % d)
         refresh_dir_label()
 
-    dir_lbl = tk.Label(dir_card, text="", font=F_UIB, bg=CARD, fg=CYAN,
+    dir_lbl = tk.Label(dir_row, text="", font=F_UIB, bg=CARD, fg=CYAN,
                        cursor="hand2", anchor="w", justify="left")
-    dir_lbl.place(relx=0.10, rely=0.5, anchor="w", relwidth=0.62)
     dir_lbl.bind("<Button-1>", open_report_dir)
     icocv.bind("<Button-1>", open_report_dir)
-    tip_lbl = tk.Label(dir_card, text="点击路径打开文件夹", font=F_DETAIL,
+    tip_lbl = tk.Label(dir_row, text="点击路径打开文件夹", font=F_DETAIL,
                        bg=CARD, fg=DIM)
-    tip_lbl.place(relx=0.74, rely=0.5, anchor="w")
 
     def refresh_dir_label():
-        dir_lbl.configure(text=shorten(path_state["dir"], 52))
+        dir_lbl.configure(text=shorten(path_state["dir"], 44))
     refresh_dir_label()
 
-    dir_btn = GButton(dir_card, "切换位置", choose_report_dir)
-    dir_btn.place(relx=0.985, rely=0.5, anchor="e")
+    dir_btn = GButton(dir_row, "切换位置", choose_report_dir)
 
-    # 进度卡
+    # pack 顺序：右侧先占位（按钮+提示），路径标签占剩余空间（过长自动截断，不重叠）
+    dir_btn.pack(side="right", padx=(S(8), S(4)))
+    tip_lbl.pack(side="right", padx=S(8))
+    icocv.pack(side="left", padx=(S(2), S(8)), pady=S(10))
+    dir_lbl.pack(side="left", fill="x", expand=True)
+
+    # 进度卡：三行垂直堆叠（绝对像素定位行容器，行内 pack 排列）
     prog_card = Card(content)
     prog_card.pack(fill="x", pady=(S(10), 0))
     prog_card.pack_propagate(False)
-    prog_card.configure(height=S(150))
-    chips = StageChips(prog_card)
-    chips.place(relx=0.02, rely=0.04, relwidth=0.96)
-    pct_lbl = tk.Label(prog_card, text="0%", font=F_UIB, bg=CARD, fg=TXT)
-    pct_lbl.place(relx=0.98, rely=0.44, anchor="e")
-    bar = ProgBar(prog_card)
-    bar.place(relx=0.02, rely=0.44, relwidth=0.80, height=S(18))
-    stage_lbl = tk.Label(prog_card, text="就绪 · 点击开始扫描", font=F_STAGE,
-                         bg=CARD, fg=TXT, anchor="w")
-    stage_lbl.place(relx=0.02, rely=0.70, anchor="w")
-    time_lbl = tk.Label(prog_card, text="", font=F_UIB, bg=CARD, fg=CYAN)
-    time_lbl.place(relx=0.98, rely=0.70, anchor="e")
-    detail_lbl = tk.Label(prog_card, text="支持 7 个阶段实时进度", font=F_DETAIL,
-                          bg=CARD, fg=DIM, anchor="w", justify="left")
-    detail_lbl.place(relx=0.02, rely=0.92, anchor="sw", relwidth=0.96)
+    prog_card.configure(height=S(168))
+
+    row1 = tk.Frame(prog_card, bg=CARD)
+    row1.place(x=S(8), y=S(6), relwidth=0.96, height=S(54))
+    chips = StageChips(row1)
+    chips.pack(fill="both", expand=True)
+
+    row2 = tk.Frame(prog_card, bg=CARD)
+    row2.place(x=S(8), y=S(66), relwidth=0.96, height=S(24))
+    pct_lbl = tk.Label(row2, text="0%", font=F_UIB, bg=CARD, fg=TXT)
+    bar = ProgBar(row2)
+    bar.pack(side="left", fill="x", expand=True, padx=(0, S(12)), pady=S(2))
+    pct_lbl.pack(side="right")
+
+    row3 = tk.Frame(prog_card, bg=CARD)
+    row3.place(x=S(8), y=S(98), relwidth=0.96, height=S(30))
+    stage_lbl = tk.Label(row3, text="就绪 · 点击开始扫描", font=F_STAGE,
+                         bg=CARD, fg=TXT)
+    detail_lbl = tk.Label(row3, text="支持 7 个阶段实时进度", font=F_DETAIL,
+                          bg=CARD, fg=DIM)
+    time_lbl = tk.Label(row3, text="", font=F_UIB, bg=CARD, fg=CYAN)
+    detail_lbl.pack(side="left", padx=(0, S(12)))
+    stage_lbl.pack(side="left")
+    time_lbl.pack(side="right")
 
     # 日志卡
     log_card = Card(content)
