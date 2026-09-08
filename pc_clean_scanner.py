@@ -61,7 +61,7 @@ DEFAULT_REPORT_DIR = os.path.join(SCRIPT_DIR, "scan_reports")
 LOG_FILE = os.path.join(SCRIPT_DIR, "扫描日志.log")
 
 FILE_ATTRIBUTE_REPARSE_POINT = 0x400
-APP_VERSION = "2.2.0"
+APP_VERSION = "2.2.1"
 GITHUB_REPO = "UltraSkyShow321/pc-clean-scanner"
 RELEASES_URL = "https://github.com/%s/releases" % GITHUB_REPO
 LEVEL_INFO = {
@@ -1941,7 +1941,11 @@ def run_gui(args, cfg, report_root):
             self._t = text
             self._hov = False
             self._en = True
-            self._cw = width or (S(34) + int(len(text) * S(15)))
+            # 宽度按字体实测自适应（字数估算在高 DPI 下会失准）
+            f = F_BTN if kind == "primary" else F_UIB
+            tw = tkfont.Font(font=f).measure(text)
+            self._cw = width or (tw + S(44))
+            self._cw = max(self._cw, S(96))
             super().__init__(master, height=h, width=self._cw, bg=BG0,
                              highlightthickness=0, cursor="hand2")
             self.bind("<Button-1>", lambda e: self._click())
@@ -1990,11 +1994,13 @@ def run_gui(args, cfg, report_root):
 
     # ---------------- 开关药丸 ----------------
     class Toggle(tk.Canvas):
-        def __init__(self, master, text, var, width=200):
+        def __init__(self, master, text, var, width=None):
             self._t = text
             self._v = var
-            self._cw = width
-            super().__init__(master, height=S(34), width=width, bg=CARD,
+            # 宽度按字体实测自适应，含右侧滑块区
+            tw = tkfont.Font(font=F_UI).measure(text)
+            self._cw = width or (tw + S(84))
+            super().__init__(master, height=S(34), width=self._cw, bg=CARD,
                              highlightthickness=0, cursor="hand2")
             self.bind("<Button-1>", lambda e: self._v.set(not self._v.get()))
             self._v.trace_add("write", lambda *a: self.redraw())
@@ -2063,7 +2069,7 @@ def run_gui(args, cfg, report_root):
 
     class StageChips(tk.Canvas):
         def __init__(self, master):
-            super().__init__(master, height=S(48), bg=CARD, highlightthickness=0)
+            super().__init__(master, height=S(52), bg=CARD, highlightthickness=0)
             self.active = 0
             self.done = set()
             self.bind("<Configure>", lambda e: self.redraw())
@@ -2095,9 +2101,17 @@ def run_gui(args, cfg, report_root):
             if w < S(140):
                 return
             cw = w / 7.0
+            # 按芯片宽度自适应缩放文字，避免溢出
+            f_num = F_CHIP
+            f_name = F_CHIP
+            avail = cw - S(14)
+            if avail < S(58):
+                f_num = tkfont.Font(root=root, family="Microsoft YaHei UI",
+                                    size=max(7, S(7)))
+                f_name = f_num
             for i in range(7):
-                x1 = i * cw + S(5)
-                x2 = (i + 1) * cw - S(5)
+                x1 = i * cw + S(4)
+                x2 = (i + 1) * cw - S(4)
                 st = i + 1
                 if st in self.done:
                     fill, edge, tc = "#11322a", "#1f7a5c", GREEN
@@ -2105,13 +2119,16 @@ def run_gui(args, cfg, report_root):
                     fill, edge, tc = "#232e6e", ACCENT, TXT
                 else:
                     fill, edge, tc = "#121a33", "#28325a", DIM
-                self.create_polygon(round_pts(x1, S(4), x2, S(44), S(10)), smooth=True,
-                                    fill=fill, outline=edge)
-                self.create_text((x1 + x2) / 2, S(15),
-                                 text=("✓" if st in self.done else str(st)),
-                                 font=F_CHIP, fill=tc)
-                self.create_text((x1 + x2) / 2, S(31), text=CHIP_NAMES[i],
-                                 font=F_CHIP, fill=tc)
+                self.create_polygon(round_pts(x1, S(3), x2, S(49), S(10)),
+                                    smooth=True, fill=fill, outline=edge)
+                cx = (x1 + x2) / 2
+                self.create_text(cx, S(15), text=("✓" if st in self.done else str(st)),
+                                 font=f_num, fill=tc)
+                name = CHIP_NAMES[i]
+                # 名字超宽时缩到两个点
+                while name and tkfont.Font(font=f_name).measure(name) > avail:
+                    name = name[:-1]
+                self.create_text(cx, S(33), text=name, font=f_name, fill=tc)
 
     # ---------------- 布局 ----------------
     content = tk.Frame(root, bg=BG0)
@@ -2124,36 +2141,36 @@ def run_gui(args, cfg, report_root):
     opt_card.configure(height=S(58))
     full_var = tk.BooleanVar(value=False)
     dup_var = tk.BooleanVar(value=True)
-    Toggle(opt_card, "全盘扫描（所有硬盘，较慢）", full_var, width=S(210)).place(
-        relx=0.025, rely=0.5, anchor="w")
-    Toggle(opt_card, "检测重复文件", dup_var, width=S(150)).place(
-        relx=0.36, rely=0.5, anchor="w")
+    # pack 顺序布局：从左到右自动排列，不会互相重叠
+    tog1 = Toggle(opt_card, "全盘扫描", full_var)
+    tog1.pack(side="left", padx=(S(18), S(6)), pady=S(10))
+    tog2 = Toggle(opt_card, "检测重复文件", dup_var)
+    tog2.pack(side="left", padx=S(6), pady=S(10))
 
     # 扫描范围多选（#12）：默认用户目录 / 指定盘符
     avail_drives = [d for d in list_drives()] if IS_WIN else ["/"]
-    scan_scope_var = tk.StringVar(value="默认（用户目录）")
+    scan_scope_var = tk.StringVar(value="范围: 默认用户目录")
     scope_menu = tk.OptionMenu(opt_card, scan_scope_var,
-                               "默认（用户目录）", *["%s 盘" % d[0] for d in avail_drives])
-    scope_menu.configure(font=F_DETAIL, bg=CARD, fg=TXT,
+                               "范围: 默认用户目录",
+                               *["范围: %s 盘" % d[0] for d in avail_drives])
+    scope_menu.configure(font=F_UI, bg=CARD, fg=TXT,
                          activebackground="#232e6e", activeforeground=TXT,
                          highlightthickness=0, bd=0, indicatoron=False,
-                         direction="below", padx=S(10), pady=S(6), cursor="hand2")
+                         direction="below", padx=S(12), pady=S(7), cursor="hand2")
     opt_card.menu = scope_menu["menu"]
-    opt_card.menu.configure(font=F_DETAIL, bg=CARD, fg=TXT,
+    opt_card.menu.configure(font=F_UI, bg=CARD, fg=TXT,
                             activebackground="#232e6e", activeforeground=TXT,
                             tearoff=0)
-    tk.Label(opt_card, text="范围", font=F_DETAIL, bg=CARD, fg=DIM).place(
-        relx=0.60, rely=0.5, anchor="e")
-    scope_menu.place(relx=0.615, rely=0.5, anchor="w")
+    scope_menu.pack(side="left", padx=S(14), pady=S(10))
 
     def scope_choice():
         """返回传给 run_scan 的 drives 字符串（空=默认用户目录）"""
         v = scan_scope_var.get()
-        if v.startswith("默认"):
+        if "默认" in v:
             return ""
-        return v[0]  # "C 盘" -> "C"
-    tk.Label(opt_card, text="勾选全盘时忽略范围选择", font=F_DETAIL,
-             bg=CARD, fg=DIM).place(relx=0.975, rely=0.5, anchor="e")
+        return v.replace("范围:", "").strip()[0]  # "C 盘" -> "C"
+    tk.Label(opt_card, text="勾选全盘时忽略范围", font=F_DETAIL,
+             bg=CARD, fg=DIM).pack(side="right", padx=S(16))
 
     # 报告位置卡（点击打开 / 可切换 / 记住上次）
     dir_card = Card(content)
@@ -2218,7 +2235,7 @@ def run_gui(args, cfg, report_root):
         dir_lbl.configure(text=shorten(path_state["dir"], 52))
     refresh_dir_label()
 
-    dir_btn = GButton(dir_card, "切换位置", choose_report_dir, width=S(104))
+    dir_btn = GButton(dir_card, "切换位置", choose_report_dir)
     dir_btn.place(relx=0.985, rely=0.5, anchor="e")
 
     # 进度卡
@@ -2231,15 +2248,15 @@ def run_gui(args, cfg, report_root):
     pct_lbl = tk.Label(prog_card, text="0%", font=F_UIB, bg=CARD, fg=TXT)
     pct_lbl.place(relx=0.98, rely=0.44, anchor="e")
     bar = ProgBar(prog_card)
-    bar.place(relx=0.02, rely=0.44, relwidth=0.84, height=S(18))
-    stage_lbl = tk.Label(prog_card, text="就绪 · 点击「开始扫描」", font=F_STAGE,
+    bar.place(relx=0.02, rely=0.44, relwidth=0.80, height=S(18))
+    stage_lbl = tk.Label(prog_card, text="就绪 · 点击开始扫描", font=F_STAGE,
                          bg=CARD, fg=TXT, anchor="w")
-    stage_lbl.place(relx=0.02, rely=0.71, anchor="w")
-    time_lbl = tk.Label(prog_card, text="耗时 --:--", font=F_UIB, bg=CARD, fg=CYAN)
-    time_lbl.place(relx=0.98, rely=0.71, anchor="e")
+    stage_lbl.place(relx=0.02, rely=0.70, anchor="w")
+    time_lbl = tk.Label(prog_card, text="", font=F_UIB, bg=CARD, fg=CYAN)
+    time_lbl.place(relx=0.98, rely=0.70, anchor="e")
     detail_lbl = tk.Label(prog_card, text="支持 7 个阶段实时进度", font=F_DETAIL,
                           bg=CARD, fg=DIM, anchor="w", justify="left")
-    detail_lbl.place(relx=0.02, rely=0.93, anchor="sw", relwidth=0.96)
+    detail_lbl.place(relx=0.02, rely=0.92, anchor="sw", relwidth=0.96)
 
     # 日志卡
     log_card = Card(content)
@@ -2262,10 +2279,10 @@ def run_gui(args, cfg, report_root):
 
     scan_btn = GButton(bottom, "开始扫描", None, kind="primary")
     scan_btn.pack(side="left")
-    open_btn = GButton(bottom, "打开报告", None, width=S(104))
+    open_btn = GButton(bottom, "打开报告", None)
     open_btn.pack(side="left", padx=(S(14), 0))
     open_btn.set_enabled(False)
-    phone_btn = GButton(bottom, "手机查看", None, width=S(104))
+    phone_btn = GButton(bottom, "手机查看", None)
     phone_btn.pack(side="left", padx=(S(14), 0))
     phone_btn.set_enabled(False)
 
@@ -2296,7 +2313,7 @@ def run_gui(args, cfg, report_root):
         pct_lbl.configure(text="0%")
         detail_lbl.configure(text="")
         stage_lbl.configure(text="准备中 …")
-        status_lbl.configure(text="扫描中…", fg="#ffc35c")
+        status_lbl.configure(text="扫描中", fg=AMBER)
         log_box.configure(state="normal")
         log_box.delete("1.0", "end")
         log_box.configure(state="disabled")
@@ -2495,7 +2512,7 @@ def run_gui(args, cfg, report_root):
     def check_update():
         latest = check_github_latest()
         if latest and version_gt(latest, APP_VERSION):
-            logq.put(("log", "🔔 发现新版本 v%s（当前 v%s），可到 %s 下载更新。"
+            logq.put(("log", "发现新版本 v%s（当前 v%s），可到 %s 下载。"
                       % (latest, APP_VERSION, RELEASES_URL)))
     threading.Thread(target=check_update, daemon=True).start()
 
