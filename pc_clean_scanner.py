@@ -27,6 +27,7 @@ import os
 import sys
 import csv
 import json
+import re
 import time
 import glob
 import ctypes
@@ -60,6 +61,9 @@ DEFAULT_REPORT_DIR = os.path.join(SCRIPT_DIR, "scan_reports")
 LOG_FILE = os.path.join(SCRIPT_DIR, "扫描日志.log")
 
 FILE_ATTRIBUTE_REPARSE_POINT = 0x400
+APP_VERSION = "2.2.0"
+GITHUB_REPO = "UltraSkyShow321/pc-clean-scanner"
+RELEASES_URL = "https://github.com/%s/releases" % GITHUB_REPO
 LEVEL_INFO = {
     "A": "放心清理 —— 缓存/临时文件，删除不影响软件功能",
     "B": "确认后清理 —— 可能含个人内容或可重新下载的资源，删除前先看一眼",
@@ -196,6 +200,54 @@ def report_dir_from(args, cfg):
     return d
 
 
+# ---------------------------------------------------------------- 保护名单(#3)
+PROTECTED_FILE = os.path.join(SCRIPT_DIR, "保护名单.json")
+
+
+def load_protected_paths():
+    """用户标记的「永不建议清理」路径列表"""
+    try:
+        with open(PROTECTED_FILE, encoding="utf-8") as f:
+            data = json.load(f)
+        return [str(p) for p in data.get("protected", []) if p]
+    except Exception:
+        return []
+
+
+def save_protected_paths(paths):
+    with open(PROTECTED_FILE, "w", encoding="utf-8") as f:
+        json.dump({"protected": sorted(set(paths))}, f, ensure_ascii=False, indent=2)
+
+
+# ---------------------------------------------------------------- 清理历史(#4)
+CLEAN_LOG_FILE = os.path.join(SCRIPT_DIR, "清理历史.json")
+
+
+def load_clean_history():
+    try:
+        with open(CLEAN_LOG_FILE, encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {"records": []}
+
+
+def append_clean_history(paths, note=""):
+    """记录一次清理（由导出的清理脚本通过 --log-clean 调用）"""
+    hist = load_clean_history()
+    rec = {"time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+           "count": len(paths), "paths": paths, "note": note}
+    hist["records"].append(rec)
+    hist["records"] = hist["records"][-200:]
+    with open(CLEAN_LOG_FILE, "w", encoding="utf-8") as f:
+        json.dump(hist, f, ensure_ascii=False, indent=2)
+
+
+def cleanup_last_scan_time(report_root):
+    """最近一次扫描的时间字符串（供 GUI 扫描提醒用）"""
+    snap = load_last_snapshot(report_root)
+    return (snap or {}).get("generated", "")
+
+
 # ---------------------------------------------------------------- 清理点定义
 def cleanup_definitions():
     """返回 (名称, 等级, 路径模式列表, 清理建议, 官方清理命令)"""
@@ -277,7 +329,52 @@ def cleanup_definitions():
         ("文档(个人数据)", "C", [os.path.join(U, "Documents")], "个人数据，仅统计体积，请自行归档。", ""),
         ("图片/视频/音乐", "C", [os.path.join(U, "Pictures"), os.path.join(U, "Videos"), os.path.join(U, "Music")],
          "个人数据，仅统计体积。", ""),
+        # ---- v2.2 新增清理点 ----
+        ("回收站占用", "A", [os.environ.get("SYSTEMDRIVE", "C:") + "\\$Recycle.Bin"],
+         "清空回收站即可释放；资源管理器内右键回收站 → 清空。", ""),
+        ("pnpm 缓存", "B", [os.path.join(L, "pnpm", "cache"), os.path.join(L, "pnpm", "store")],
+         "pnpm store prune 可安全清理未引用包。", "pnpm store prune"),
+        ("Go 模块缓存", "B", [os.path.join(U, "go", "pkg", "mod")],
+         "go clean -modcache 清理已下载模块。", "go clean -modcache"),
+        ("uv 缓存", "B", [os.path.join(L, "uv", "cache")],
+         "uv cache clean 清理。", "uv cache clean"),
+        ("Cargo 注册表缓存", "B", [os.path.join(U, ".cargo", "registry")],
+         "rust 开发依赖缓存，删后重新下载。", ""),
+        ("Torch 模型缓存", "B", [os.path.join(U, ".cache", "torch")],
+         "PyTorch 预训练模型权重，确认不再用再清。", ""),
+        ("Docker 构建缓存/悬空镜像", "B", [os.path.join(L, "Docker", "wsl", "data", "ext4.vhdx")],
+         "docker system prune -a 清理未使用镜像/构建缓存；虚拟磁盘压缩需 Docker Desktop → Troubleshoot。"
+         " 悬空镜像可用 docker image prune 单独清。", "docker system prune -a -f"),
+        ("系统还原点占用", "C", [os.path.join(W, "System Volume Information")],
+         "系统还原/卷影副本占用，需管理员：vssadmin list shadowstorage 查看，"
+         "vssadmin resize shadowstorage 调整上限。", "vssadmin list shadowstorage"),
     ]
+
+
+# 微信/QQ 接收文件按年份细分（B 级，在 run_scan 中动态计算）
+def wechat_year_definitions():
+    U = os.environ.get("USERPROFILE", "")
+    base = []
+    for root in (os.path.join(U, "Documents", "WeChat Files"),
+                 os.path.join(U, "Documents", "Tencent Files"),
+                 os.path.join(U, "Documents", "xwechat_files")):
+        if os.path.isdir(root):
+            try:
+                for e in os.scandir(root):
+                    if e.is_dir(follow_symlinks=False):
+                        base.append(e.path)
+            except OSError:
+                pass
+    # 取一层（通常是账号目录），里面才是 FileStorage
+    out = []
+    for acct in base:
+        try:
+            for e in os.scandir(acct):
+                if e.is_dir(follow_symlinks=False) and e.name.lower() in ("filestorage", "filestorage_cache", "files"):
+                    out.append(e.path)
+        except OSError:
+            pass
+    return out
 
 
 DEPEND_DIR_NAMES = {"node_modules", "venv", ".venv", "target", "__pycache__",
@@ -358,6 +455,94 @@ def scan_tree(root, max_depth=4, skip_names=None, on_file=None):
             except (PermissionError, FileNotFoundError, OSError):
                 continue
     return total, count
+
+
+def scan_tree_stale(root, max_depth=4, skip_names=None):
+    """统计 root 下体积，并返回加权平均的「最后活跃时间」。
+    返回 (size, file_count, last_active_ts)。last_active_ts 按文件大小加权，
+    大文件的活动时间权重更高，能代表该目录「最近是否在用」。"""
+    skip_names = skip_names or set()
+    total = 0
+    count = 0
+    w_sum = 0.0        # 权重和
+    w_time = 0.0       # 加权时间和
+    stack = [(root, 0)]
+    while stack:
+        path, depth = stack.pop()
+        try:
+            entries = os.scandir(path)
+        except (PermissionError, FileNotFoundError, OSError):
+            continue
+        for e in entries:
+            try:
+                st = e.stat(follow_symlinks=False)
+            except (PermissionError, FileNotFoundError, OSError):
+                continue
+            if is_symlink(e.path, st):
+                continue
+            try:
+                if e.is_dir(follow_symlinks=False):
+                    if e.name.lower() in skip_names:
+                        continue
+                    if depth < max_depth:
+                        stack.append((e.path, depth + 1))
+                elif e.is_file(follow_symlinks=False):
+                    total += st.st_size
+                    count += 1
+                    w = st.st_size + 1.0
+                    w_sum += w
+                    w_time += w * st.st_mtime
+            except (PermissionError, FileNotFoundError, OSError):
+                continue
+    last_active = (w_time / w_sum) if w_sum > 0 else 0.0
+    return total, count, last_active
+
+
+# ---------------------------------------------------------------- 清理优先级评分
+def cleanup_score(level, size, last_active):
+    """清理优先级评分 0~5 星（保留 1 位小数）。
+    规则：安全等级(A=2/B=1/C=0 基础分) + 体积(>1GB=2, >256MB=1.5, >64MB=1,
+    >16MB=0.5, 其他 0.2) + 陈旧度(>180天=1, >90天=0.6, >30天=0.3, 活跃=0)。"""
+    base = {"A": 2.0, "B": 1.0, "C": 0.0}.get(level, 0.0)
+    if size > 1 * 2**30:
+        vs = 2.0
+    elif size > 256 * 2**20:
+        vs = 1.5
+    elif size > 64 * 2**20:
+        vs = 1.0
+    elif size > 16 * 2**20:
+        vs = 0.5
+    else:
+        vs = 0.2
+    if last_active <= 0:
+        ss = 0.3  # 无法判断时给中性偏保守分
+    else:
+        days = max(0.0, (time.time() - last_active) / 86400.0)
+        if days > 180:
+            ss = 1.0
+        elif days > 90:
+            ss = 0.6
+        elif days > 30:
+            ss = 0.3
+        else:
+            ss = 0.0
+    score = min(5.0, base + vs + ss)
+    return round(score, 1)
+
+
+def fmt_stale(last_active):
+    """陈旧度文案"""
+    if last_active <= 0:
+        return "-"
+    days = max(0, int((time.time() - last_active) / 86400))
+    if days <= 7:
+        return "本周活跃"
+    if days <= 30:
+        return "%d 天未更新" % days
+    if days <= 90:
+        return "%d 天未更新" % days
+    return "%d 天未更新" % days
+
 
 
 def scan_top_folders(drive_root, max_depth=4):
@@ -553,7 +738,161 @@ def find_duplicates(roots, min_bytes, time_limit=None, max_groups=50, on_progres
     return groups
 
 
-# ---------------------------------------------------------------- 历史对比
+# ---------------------------------------------------------------- 大文件类型聚类(#9)
+FILE_TYPE_RULES = [
+    ("视频", (".mp4", ".mkv", ".avi", ".mov", ".wmv", ".flv", ".ts", ".m4v", ".rmvb")),
+    ("安装包", (".exe", ".msi", ".msix", ".apk")),
+    ("压缩包", (".zip", ".rar", ".7z", ".tar", ".gz", ".bz2", ".xz", ".iso")),
+    ("虚拟机/磁盘镜像", (".vhd", ".vhdx", ".vmdk", ".qcow2", ".img", ".dmg", ".wim")),
+    ("数据库文件", (".mdb", ".db", ".sqlite", ".mdf", ".ldf", ".ibd")),
+    ("文档", (".pdf", ".doc", ".docx", ".ppt", ".pptx", ".xls", ".xlsx", ".md", ".txt")),
+    ("图片", (".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp", ".heic", ".raw", ".psd", ".tif")),
+    ("音频", (".mp3", ".flac", ".wav", ".ape", ".m4a", ".ogg")),
+    ("模型权重", (".safetensors", ".bin", ".pt", ".pth", ".ckpt", ".gguf", ".onnx")),
+    ("日志/转储", (".log", ".dmp", ".dump", ".tmp")),
+]
+
+
+def classify_file(path):
+    ext = os.path.splitext(path)[1].lower()
+    for label, exts in FILE_TYPE_RULES:
+        if ext in exts:
+            return label
+    return "其他"
+
+
+def cluster_large_files(large_files):
+    """按类型聚类大文件，返回 [{type, size, files, top_path}]，并做相似文件名归组"""
+    clusters = {}
+    for f in large_files:
+        t = classify_file(f["path"])
+        c = clusters.setdefault(t, {"type": t, "size": 0, "files": 0, "top": f})
+        c["size"] += f["size"]
+        c["files"] += 1
+    out = sorted(clusters.values(), key=lambda x: -x["size"])
+    for c in out:
+        c.pop("top", None)
+    # 相似文件名序列归组（同目录/同类型，名字尾部带编号的差异）
+    def base_name(p):
+        n = os.path.basename(p)
+        n = re.sub(r"[_\-.\s]*\d{1,4}(?=\.[^.]+$)", "", n)   # 去掉尾部编号
+        n = re.sub(r"[\(\[（【]?\d{1,3}[\)\]）】]?(?=\.[^.]+$)", "", n)
+        d = os.path.dirname(p)
+        return d.lower() + "|" + n.lower()
+    groups = {}
+    for f in large_files:
+        key = base_name(f["path"])
+        g = groups.setdefault(key, {"key": key, "size": 0, "count": 0, "sample": f["path"]})
+        g["size"] += f["size"]
+        g["count"] += 1
+    serials = [g for g in groups.values() if g["count"] >= 3]
+    serials.sort(key=lambda g: -g["size"])
+    return out, serials[:12]
+
+
+# ---------------------------------------------------------------- 空文件夹与同名文件(#2)
+def find_empty_folders(roots, limit=200, time_limit=60):
+    """找空文件夹（不含隐藏系统目录）"""
+    out = []
+    deadline = time.time() + time_limit if time_limit else None
+    skip = {"$recycle.bin", "system volume information", "windows", "windows.old",
+            "appdata", "$windows.~bt", "node_modules", ".git", "__pycache__"}
+    for root in roots:
+        stack = [root]
+        while stack:
+            if deadline and time.time() > deadline:
+                return out
+            path = stack.pop()
+            try:
+                entries = list(os.scandir(path))
+            except (PermissionError, FileNotFoundError, OSError):
+                continue
+            if not entries:
+                out.append(path)
+                if len(out) >= limit:
+                    return out
+                continue
+            for e in entries:
+                try:
+                    if e.is_dir(follow_symlinks=False) and not is_symlink(e.path):
+                        if e.name.lower() not in skip:
+                            stack.append(e.path)
+                except (PermissionError, FileNotFoundError, OSError):
+                    continue
+    return out
+
+
+def find_same_name_files(large_files):
+    """同名但不同位置的大文件（可能是多份拷贝）"""
+    by_name = {}
+    for f in large_files:
+        by_name.setdefault(os.path.basename(f["path"]).lower(), []).append(f)
+    out = []
+    for name, fs in by_name.items():
+        if len(fs) >= 2:
+            out.append({"name": name, "files": [{"path": f["path"], "size": f["size"]}
+                                                for f in fs],
+                        "wasted": sum(f["size"] for f in fs) - max(f["size"] for f in fs)})
+    out.sort(key=lambda g: -g["wasted"])
+    return out[:30]
+
+
+# ---------------------------------------------------------------- 重复文件保留策略(#2)
+KEEP_HINT_DIRS = ("documents", "desktop", "work", "workspace", "projects", "code", "dev")
+DROP_HINT_DIRS = ("temp", "cache", "downloads", "recycle", "tmp", "backup", "old", "副本")
+
+
+def dup_keep_suggestion(files):
+    """为重复组建议保留哪个文件：位于工作/文档目录的优先保留；
+    位于缓存/下载/临时目录的标为建议删除。返回每文件的标记列表。"""
+    def score(p):
+        low = p.lower().replace("/", "\\")
+        s = 0
+        if any(k in low for k in KEEP_HINT_DIRS):
+            s += 2
+        if any(k in low for k in DROP_HINT_DIRS):
+            s -= 2
+        # 更早的文件（原始版本）略加分
+        try:
+            s += (os.path.getmtime(p) < time.time() - 30 * 86400) and 0.5 or 0
+        except OSError:
+            pass
+        return s
+    ranked = sorted(files, key=lambda p: (-score(p), p))
+    keep = ranked[0]
+    marks = []
+    for f in files:
+        if f == keep:
+            marks.append("keep")
+        elif score(f) < score(keep):
+            marks.append("drop")
+        else:
+            marks.append("dup")  # 同分，均为候选副本
+    return marks
+
+
+def load_snapshots(report_root, limit=10):
+    """按时间返回最近的 N 次 summary.json 快照（旧→新）"""
+    snaps = []
+    try:
+        stamps = sorted(d for d in os.listdir(report_root)
+                        if os.path.isdir(os.path.join(report_root, d)))
+    except OSError:
+        return snaps
+    for stamp in reversed(stamps):
+        p = os.path.join(report_root, stamp, "summary.json")
+        if os.path.exists(p):
+            try:
+                with open(p, encoding="utf-8") as f:
+                    snaps.append(json.load(f))
+            except Exception:
+                continue
+        if len(snaps) >= limit:
+            break
+    snaps.reverse()
+    return snaps
+
+
 def load_last_snapshot(report_root):
     """找上一次扫描的 summary.json"""
     try:
@@ -691,6 +1030,17 @@ def guess_program_category(name, publisher):
 
 
 # ---------------------------------------------------------------- 主扫描
+def scan_roots_for(args, drives, home):
+    """统一的扫描根选择：--drives 指定盘符 > --full 全盘 > 默认用户目录"""
+    if getattr(args, "drives", ""):
+        roots = [r.strip().rstrip("\\") + "\\" for r in args.drives.split(",")
+                 if r.strip()]
+        return [r for r in roots if os.path.isdir(r)] or [home]
+    if args.full:
+        return drives
+    return [home]
+
+
 def run_scan(args, report_root):
     t0 = time.time()
     home = os.path.expanduser("~")
@@ -723,32 +1073,44 @@ def run_scan(args, report_root):
     LOG("[2/7] 正在统计各类缓存/清理点体积 ...")
     cleanups = []
     defs = cleanup_definitions()
+    protected = load_protected_paths()
     for i, (name, level, patterns, tip, cmd) in enumerate(defs):
         _prog(2, i / max(1, len(defs)), name)
         paths = expand_paths(patterns)
         size = 0
         files = 0
+        last_active = 0.0
         if paths:
             for p in paths:
                 if os.path.isdir(p):
                     depth = 3 if level == "B" else 4
-                    s, c = scan_tree(p, max_depth=depth)
+                    s, c, la = scan_tree_stale(p, max_depth=depth)
                     size += s
                     files += c
+                    if la > last_active:
+                        last_active = la
                 elif os.path.isfile(p):
                     try:
                         size += os.path.getsize(p)
                         files += 1
+                        la = os.path.getmtime(p)
+                        if la > last_active:
+                            last_active = la
                     except OSError:
                         pass
+        is_protected = any(p and (p in pr or pr in p) for pr in protected for p in paths)
         cleanups.append({"name": name, "level": level, "size": size,
-                         "files": files, "paths": paths, "tip": tip, "cmd": cmd})
+                         "files": files, "paths": paths, "tip": tip, "cmd": cmd,
+                         "last_active": last_active,
+                         "stale_text": fmt_stale(last_active),
+                         "score": cleanup_score(level, size, last_active),
+                         "protected": is_protected})
         LOG("    %-28s %s" % (name, fmt_size(size)))
     _prog(2, 1.0, "共 %d 个清理点" % len(cleanups))
 
     # 3b) 项目依赖目录(node_modules 等)
     LOG("[3/7] 正在扫描项目依赖目录(node_modules/venv/target) ...")
-    dep_roots = [home] if not args.full else drives
+    dep_roots = scan_roots_for(args, drives, home)
 
     def dep_prog(path, nhits):
         _prog(3, -1, "%s ｜ 已找到 %d 个" % (path, nhits))
@@ -764,7 +1126,7 @@ def run_scan(args, report_root):
 
     # 4) 大文件
     LOG("[4/7] 正在搜索大文件(>=%s) ..." % fmt_size(args.min_size))
-    roots = drives if args.full else ([home] if IS_WIN else [home])
+    roots = scan_roots_for(args, drives, home)
 
     def big_prog(path):
         _prog(4, -1, path)
@@ -772,6 +1134,18 @@ def run_scan(args, report_root):
     large = find_large_files(roots, args.min_size, max_depth=8,
                              time_limit=args.timeout, on_progress=big_prog)
     _prog(4, 1.0, "找到 %d 个大文件" % len(large))
+
+    # 4b) 大文件类型聚类 + 相似文件名归组 + 同名文件(#9/#2)
+    LOG("    正在做大文件类型聚类 ...")
+    large_clusters, serial_groups = cluster_large_files(large)
+    same_name = find_same_name_files(large)
+    LOG("    类型聚类 %d 组，相似序列 %d 组，同名文件 %d 组"
+        % (len(large_clusters), len(serial_groups), len(same_name)))
+
+    # 4c) 空文件夹(#2)
+    empty_roots = scan_roots_for(args, drives, home)
+    empty_folders = find_empty_folders(empty_roots, time_limit=min(60, args.timeout))
+    LOG("    找到 %d 个空文件夹" % len(empty_folders))
 
     # 5) 文件夹体积排行
     LOG("[5/7] 正在统计文件夹体积排行 ...")
@@ -789,7 +1163,7 @@ def run_scan(args, report_root):
     dup_groups = []
     if not args.no_duplicates:
         LOG("[6/7] 正在检测重复文件(>=%s，按内容哈希) ..." % fmt_size(args.dup_min))
-        dup_roots = drives if args.full else [home]
+        dup_roots = scan_roots_for(args, drives, home)
 
         def dup_prog(path, nsizes):
             _prog(6, -1, "%s ｜ %d 种尺寸" % (path, nsizes))
@@ -800,6 +1174,26 @@ def run_scan(args, report_root):
         wasted = sum(g["wasted"] for g in dup_groups)
         LOG("    找到 %d 组重复文件，可释放约 %s" % (len(dup_groups), fmt_size(wasted)))
         _prog(6, 1.0, "%d 组重复，约 %s" % (len(dup_groups), fmt_size(wasted)))
+        # 保留策略建议(#2)：每组建议保留哪个、删除哪个
+        for g in dup_groups:
+            g["marks"] = dup_keep_suggestion(g["files"])
+    else:
+        pass
+
+    # 6b) 微信/QQ 接收文件按账号-存储目录细分(#11)
+    wechat_dirs = wechat_year_definitions()
+    wechat_rows = []
+    if wechat_dirs:
+        LOG("    正在细分微信/QQ 接收文件目录 ...")
+        for wd in wechat_dirs:
+            s, c, la = scan_tree_stale(wd, max_depth=5)
+            if s > 0:
+                wechat_rows.append({"path": wd, "size": s, "files": c,
+                                    "last_active": la,
+                                    "stale_text": fmt_stale(la)})
+        wechat_rows.sort(key=lambda x: -x["size"])
+        LOG("    微信/QQ 存储目录 %d 个，合计 %s"
+            % (len(wechat_rows), fmt_size(sum(w["size"] for w in wechat_rows))))
 
     # 7) 历史对比
     LOG("[7/7] 正在与上次扫描结果对比 ...")
@@ -808,6 +1202,19 @@ def run_scan(args, report_root):
     compare = diff_snapshot({"disks": disks, "cleanups": cleanups,
                              "folders": folder_rows, "generated":
                              datetime.now().strftime("%Y-%m-%d %H:%M:%S")}, prev)
+    # 近 10 次快照的趋势数据（含本次）
+    _prog(7, 0.4, "汇总空间趋势 ...")
+    snaps = load_snapshots(report_root, 10)
+    trend = []
+    for s in snaps:
+        trend.append({"generated": s.get("generated", "?"),
+                      "disks": {d["root"]: d["free"] for d in s.get("disks", [])}})
+    trend.append({"generated": datetime.now().strftime("%Y-%m-%d %H:%M"),
+                  "disks": {d["root"]: d["free"] for d in disks},
+                  "current": True})
+    # 清理历史（供报告展示）
+    _prog(7, 0.6, "读取清理历史 ...")
+    clean_hist = load_clean_history()
 
     LOG("正在生成报告 ...")
     return {
@@ -820,9 +1227,17 @@ def run_scan(args, report_root):
         "cleanups": cleanups,
         "dep_dirs": dep_dirs,
         "large_files": large,
+        "large_clusters": large_clusters,
+        "serial_groups": serial_groups,
+        "same_name": same_name,
+        "empty_folders": empty_folders,
+        "wechat_rows": wechat_rows,
         "folders": folder_rows,
         "duplicates": dup_groups,
         "compare": compare,
+        "trend": trend,
+        "clean_history": clean_hist.get("records", []),
+        "protected": protected,
         "min_size": args.min_size,
         "dup_min": args.dup_min,
     }
@@ -993,7 +1408,8 @@ function makeSortable(tbodyId, rows, render, sortKeys){
 
 // ================= Tabs =================
 const TABS=[["disk","💾 磁盘与对比"],["cleanup","🧽 清理点(A/B/C)"],["dup","🔁 重复文件"],
-  ["dep","📦 项目依赖目录"],["programs","🪀 已安装程序"],["large","🐘 大文件排行"],["folders","📁 文件夹体积"]];
+  ["dep","📦 项目依赖目录"],["programs","🪀 已安装程序"],["large","🐘 大文件排行"],["folders","📁 文件夹体积"],
+  ["trend","📈 空间趋势"],["hist","🗂 清理历史"]];
 const tabsEl=document.getElementById("tabs"),panelsEl=document.getElementById("panels");
 TABS.forEach(([id,label],i)=>{
   const b=document.createElement("button");b.textContent=label;b.onclick=()=>show(id);
@@ -1038,14 +1454,16 @@ function tableHTML(id,headers){return "<table><thead id='th-"+id+"'><tr>"+
 })();
 
 // ================= 清理点(含勾选) =================
-const CHECKS={};
-function chkBox(kind,path){const id=kind+"|"+path;
-  return "<input type='checkbox' class='chk' data-id='"+esc(id)+"' data-path='"+esc(path)+"' onchange='onCheck(this)'>";}
+const CHECKS={};const CHKSIZE={};
+function chkBox(kind,path,size){const id=kind+"|"+path;
+  return "<input type='checkbox' class='chk' data-id='"+esc(id)+"' data-path='"+esc(path)+"' data-size='"+(size||0)+"' onchange='onCheck(this)'>";}
 function onCheck(el){
-  if(el.checked)CHECKS[el.dataset.id]=el.dataset.path;else delete CHECKS[el.dataset.id];
+  if(el.checked){CHECKS[el.dataset.id]=el.dataset.path;CHKSIZE[el.dataset.id]=+el.dataset.size||0;}
+  else{delete CHECKS[el.dataset.id];delete CHKSIZE[el.dataset.id];}
   const n=Object.keys(CHECKS).length;
+  const total=Object.values(CHKSIZE).reduce((a,b)=>a+b,0);
   document.getElementById("exportBar").style.display=n?"flex":"none";
-  document.getElementById("selInfo").textContent="已勾选 "+n+" 项，可导出清理脚本";
+  document.getElementById("selInfo").textContent="已勾选 "+n+" 项，预计可释放 "+h(total)+"（大小可估计的项）";
 }
 function clearChecks(){Object.keys(CHECKS).forEach(k=>delete CHECKS[k]);
   document.querySelectorAll(".chk").forEach(c=>c.checked=false);
@@ -1053,23 +1471,28 @@ function clearChecks(){Object.keys(CHECKS).forEach(k=>delete CHECKS[k]);
 function exportScript(){
   const paths=Object.values(CHECKS);
   if(!paths.length)return;
-  // 生成 .bat：逐项用 PowerShell 移入回收站（可撤销）
-  const psLine=p=>{
+  // 生成 .bat：逐项用 PowerShell 移入回收站（可撤销），显示逐项进度，结束后回调记录清理历史
+  const tool=DATA.tool_path||"";
+  const psLine=(p,i)=>{
     const q=p.replace(/'/g,"''");
     return "powershell -NoProfile -Command \"Add-Type -AssemblyName Microsoft.VisualBasic; "+
+      "echo [进度 "+i+"/"+paths.length+"] 处理: "+p.replace(/["<>|&]/g,"")+"; "+
       "if(Test-Path -LiteralPath '"+q+"' -PathType Container){"+
       "[Microsoft.VisualBasic.FileIO.FileSystem]::DeleteDirectory('"+q+"','OnlyErrorDialogs','SendToRecycleBin')"+
       "}else{[Microsoft.VisualBasic.FileIO.FileSystem]::DeleteFile('"+q+"','OnlyErrorDialogs','SendToRecycleBin')}\"";
   };
+  const logLine=tool?("\"\r\n\""+tool.replace(/"/g,"")+"\" --log-clean \""+paths.join("|")+"\""):"";
   const bat="@echo off\r\nchcp 65001 >nul\r\necho ============================================\r\n"+
     "echo 即将把以下 "+paths.length+" 项移入回收站(可撤销):\r\n"+
     paths.map(p=>"echo   "+p).join("\r\n")+"\r\n"+
     "echo ============================================\r\npause\r\n"+
-    paths.map(psLine).join("\r\n")+"\r\necho 完成！文件已在回收站，确认无误后可清空回收站。\r\npause\r\n";
+    paths.map((p,i)=>psLine(p,i+1)).join("\r\n")+"\r\n"+
+    "echo.\r\necho 全部完成！文件已在回收站，确认无误后可清空回收站。\r\n"+
+    (logLine?"echo (已自动记录到清理历史)\r\n":"")+"pause\r\n";
   const blob=new Blob([bat],{type:"text/plain;charset=utf-8"});
   const a=document.createElement("a");a.href=URL.createObjectURL(blob);
   a.download="清理脚本-请先审阅.bat";a.click();
-  alert("脚本已下载：清理脚本-请先审阅.bat\n\n请先打开检查路径列表，确认无误后再运行。\n脚本会把勾选的每一项移入回收站(可撤销，不会直接删除)。");
+  toast("脚本已下载：清理脚本-请先审阅.bat（请先审阅路径列表再运行）");
 }
 (function(){
   const rows=DATA.cleanups;
@@ -1077,43 +1500,77 @@ function exportScript(){
   const stats=Object.keys(sum).map(l=>"<div class='stat'><div class='v'>"+h(sum[l])+"</div><div class='k'>"+l+" 级合计 — "+
     (l==="A"?"缓存临时文件，放心清":l==="B"?"确认后清理":"谨慎/仅了解")+"</div></div>").join("");
   document.getElementById("panel-cleanup").innerHTML=
-    "<h2>清理点分级</h2><div class='sub'>勾选要清理的文件夹，然后点底部"导出清理脚本"。A=放心清理 · B=确认后清理 · C=谨慎(只统计)</div>"+
+    "<h2>清理点分级（含清理优先级评分）</h2><div class='sub'>星级 = 安全等级 + 体积 + 陈旧度综合评分，★★★★★ 最值得优先处理；点击「保护」可把路径加入永不建议清理名单</div>"+
     "<div class='grid' style='margin-bottom:12px'>"+stats+"</div>"+
-    "<div class='toolbar'><input type='text' id='cl-q' placeholder='🔍 筛选名称...'><button class='btn ghost' onclick='checkAllA()'>全选 A 级</button></div>"+
-    tableHTML("cl",[["",""],["名称","name"],["等级","level"],["当前体积","size"],["文件数","files"],["位置",""],["清理建议",""]]);
+    "<div class='toolbar'></div>"+
+    tableHTML("cl",[["",""],["名称","name"],["等级","level"],["评分","score"],["当前体积","size"],["陈旧度","stale"],["文件数","files"],["位置",""],["清理建议",""]]);
   makeSortable("cl",rows,c=>{
-    const cleanable=c.paths&&c.paths.length&&c.level!=="C";
-    return "<tr><td>"+(cleanable?chkBox("cl",c.paths[0]):"")+"</td><td>"+esc(c.name)+"</td>"+
-    "<td><span class='lvl lvl-"+c.level+"'>"+c.level+"</span></td><td class='num'>"+h(c.size)+"</td>"+
-    "<td class='num'>"+c.files+"</td><td class='tip'>"+esc((c.paths||[]).join(" ; "))+"</td>"+
-    "<td class='tip'>"+esc(c.tip)+(c.cmd?"<br><code>"+esc(c.cmd)+"</code>":"")+"</td></tr>";
-  },{name:r=>r.name,level:r=>r.level,size:r=>r.size,files:r=>r.files});
-  // 筛选框手动接线(表格里的 id 是 cl-q)
-  const q=document.createElement("input");q.id="cl-q";q.placeholder="🔍 筛选名称...";
-  document.querySelector("#panel-cleanup .toolbar").innerHTML="";
+    const cleanable=c.paths&&c.paths.length&&c.level!=="C"&&!c.protected;
+    const stars="★★★★★☆☆☆☆☆".slice(0,Math.round(c.score||0))+
+                "☆☆☆☆☆".slice(0,5-Math.round(c.score||0));
+    return "<tr"+(c.protected?" style='opacity:.45'":"")+"><td>"+(cleanable?chkBox("cl",c.paths[0],c.size):"")+"</td><td>"+esc(c.name)+
+    (c.protected?" <span class='lvl' style='background:#64748b'>已保护</span>":"")+"</td>"+
+    "<td><span class='lvl lvl-"+c.level+"'>"+c.level+"</span></td>"+
+    "<td title='优先级 "+(c.score||0)+"/5'>"+stars+"</td>"+
+    "<td class='num'>"+h(c.size)+"</td><td class='num'>"+esc(c.stale_text||"-")+"</td>"+
+    "<td class='num'>"+c.files+"</td><td class='tip'>"+esc((c.paths||[]).join(" ; "))+
+    ((c.paths&&c.paths.length)?" <a href='#' onclick='protectPath(this,"+JSON.stringify(JSON.stringify(c.paths[0]))+");return false' style='font-size:11px'>"+(c.protected?"取消保护":"保护")+"</a>":"")+"</td>"+
+    "<td class='tip'>"+esc(c.tip)+(c.cmd?"<br><code>"+esc(c.cmd)+"</code> <a href='#' onclick='copyCmd("+JSON.stringify(JSON.stringify(c.cmd))+");return false' style='font-size:11px'>复制命令</a>":"")+"</td></tr>";
+  },{name:r=>r.name,level:r=>r.level,size:r=>r.size,files:r=>r.files,
+    score:r=>r.score||0,stale:r=>r.last_active||0});
   const tb=document.querySelector("#panel-cleanup .toolbar");
   const qq=document.createElement("input");qq.type="text";qq.id="cl-q";qq.placeholder="🔍 筛选名称...";
   const btn=document.createElement("button");btn.className="btn ghost";btn.textContent="全选 A 级";btn.onclick=checkAllA;
   tb.append(qq,btn);
+  // 微信/QQ 接收文件细分(#11)
+  const wx=DATA.wechat_rows||[];
+  if(wx.length){
+    const div=document.createElement("div");div.style.marginTop="16px";
+    div.innerHTML="<h2 style='margin:0 0 4px'>微信/QQ 接收文件细分</h2>"+
+      "<div class='sub'>按账号-存储目录拆分，老的目录可先清</div>"+
+      tableHTML("wx",[["目录",""],["体积","size"],["陈旧度",""],["文件数","files"]]);
+    document.getElementById("panel-cleanup").appendChild(div);
+    makeSortable("wx",wx,w=>{
+      return "<tr><td class='tip'>"+esc(w.path)+"</td><td class='num'>"+h(w.size)+
+      "</td><td class='num'>"+esc(w.stale_text||"-")+"</td><td class='num'>"+w.files+"</td></tr>";
+    },{size:w=>w.size,files:w=>w.files});
+  }
 })();
+function protectPath(el, path){
+  // HTML 报告是静态文件，无法直接写保护名单；复制命令到剪贴板，运行后生效
+  const marked=el.textContent==="取消保护";
+  const flag=marked?"--unprotect":"--protect";
+  const tool=DATA.tool_path||"电脑清理扫描器.exe";
+  const cmd="\""+tool+"\" "+flag+" \""+path+"\"";
+  if(navigator.clipboard&&navigator.clipboard.writeText){
+    navigator.clipboard.writeText(cmd).then(
+      ()=>toast((marked?"已复制取消保护命令":"已复制保护命令")+"，请在 cmd 中运行后生效：\n"+cmd),
+      ()=>toast("请手动运行：\n"+cmd));}
+  else toast("请手动运行：\n"+cmd);
+  el.textContent=marked?"保护":"取消保护";
+  el.closest("tr").style.opacity=marked?"1":".45";
+}
 function checkAllA(){
-  document.querySelectorAll("#cl input.chk").forEach(()=>{});
   DATA.cleanups.forEach(c=>{
-    if(c.level==="A"&&c.paths&&c.paths.length){
-      const id="cl|"+c.paths[0];CHECKS[id]=c.paths[0];}});
-  document.querySelectorAll("#cl tr").forEach(tr=>{
-    const td=tr.querySelector("td .chk");});
-  // 重新渲染并勾上
-  document.querySelectorAll("#cl .chk").forEach(c=>{});
-  // 简单方案：重画表格
-  const draw=window._drawCl;if(draw)draw();
-  // 手动同步复选框状态
+    if(c.level==="A"&&c.paths&&c.paths.length&&!c.protected){
+      const id="cl|"+c.paths[0];CHECKS[id]=c.paths[0];CHKSIZE[id]=c.size;}});
+  window._drawCl&&window._drawCl();
   document.querySelectorAll("#cl .chk").forEach(c=>{c.checked=!!CHECKS[c.dataset.id];});
-  onCheck({checked:true,dataset:{id:"_sync",path:""}});
+  onCheck({checked:Object.keys(CHECKS).length>0,dataset:{id:"_sync",path:""}});
   document.querySelectorAll("#cl .chk").forEach(c=>{c.checked=!!CHECKS[c.dataset.id];});
-  const n=Object.keys(CHECKS).length;
-  document.getElementById("exportBar").style.display=n?"flex":"none";
-  document.getElementById("selInfo").textContent="已勾选 "+n+" 项，可导出清理脚本";
+}
+function copyCmd(cmd){
+  navigator.clipboard&&navigator.clipboard.writeText(cmd).then(
+    ()=>{toast("已复制命令："+cmd)},
+    ()=>{toast("复制失败，请手动选择命令文本复制")});
+}
+function toast(msg){
+  let t=document.getElementById("_toast");
+  if(!t){t=document.createElement("div");t.id="_toast";
+    t.style.cssText="position:fixed;top:18px;left:50%;transform:translateX(-50%);background:#0f172a;color:#fff;padding:10px 20px;border-radius:8px;font-size:13px;z-index:99;box-shadow:0 4px 14px rgba(0,0,0,.25)";
+    document.body.appendChild(t);}
+  t.textContent=msg;t.style.display="block";
+  clearTimeout(t._h);t._h=setTimeout(()=>{t.style.display="none"},2600);
 }
 """
 PANEL_JS += """
@@ -1121,16 +1578,40 @@ PANEL_JS += """
 (function(){
   const rows=DATA.duplicates||[];
   const wasted=rows.reduce((s,g)=>s+g.wasted,0);
-  let html="<h2>重复文件（内容完全相同）</h2><div class='sub'>保留每组第一个文件，其余重复副本可删；共 "+
+  let html="<h2>重复文件（内容完全相同）</h2><div class='sub'>✔ 保留=建议保留（工作/文档目录优先），🗑 副本=建议删除候选（缓存/下载/临时目录）；共 "+
     rows.length+" 组，重复占用约 <b>"+h(wasted)+"</b></div>";
   if(!rows.length){html+="<p class='tip'>没有发现大体积重复文件（门槛 ≥ "+h(DATA.dup_min)+"）</p>";}
   else{
+    const markTag=m=>m==="keep"?"<span style='color:#16a34a;font-weight:600'>✔ 保留:</span>":
+      m==="drop"?"<span style='color:#dc2626;font-weight:600'>🗑 删除:</span>":
+      "<span style='color:#6b7280'>↳ 副本:</span>";
     html+="<div class='toolbar'><input type='text' id='dup-q' placeholder='🔍 筛选路径...'></div>"+
-    tableHTML("dup",[["组","gi"],["单个体积","size"],["重复浪费","wasted"],["文件列表",""]]);
+    tableHTML("dup",[["组","gi"],["单个体积","size"],["重复浪费","wasted"],["文件列表(含保留建议)",""]]);
     makeSortable("dup",rows.map((g,i)=>({...g,gi:i+1})),g=>{
+      const marks=g.marks||g.files.map((_,i)=>i?"drop":"keep");
       return "<tr><td class='num'>"+g.gi+"</td><td class='num'>"+h(g.size)+"</td><td class='num delta-up'>"+h(g.wasted)+
-      "</td><td>"+g.files.map((f,i)=>"<div class='"+(i?"tip":"")+"'>"+(i?"↳ 副本: ":"✔ 保留: ")+esc(f)+"</div>").join("")+"</td></tr>";
+      "</td><td>"+g.files.map((f,i)=>"<div class='"+(i?"tip":"")+"'>"+markTag(marks[i])+" "+esc(f)+"</div>").join("")+"</td></tr>";
     },{gi:g=>g.gi,size:g=>g.size,wasted:g=>g.wasted});
+  }
+  // 同名不同位置的大文件(#2)
+  const sn=DATA.same_name||[];
+  if(sn.length){
+    html+="<h2 style='margin-top:18px'>同名文件（不同位置，疑似多份拷贝）</h2>"+
+      "<div class='sub'>名字相同但内容未必相同，删除前请自行比对</div>"+
+      tableHTML("sn",[["文件名","name"],["重复浪费","wasted"],["位置列表",""]]);
+    makeSortable("sn",sn,g=>{
+      return "<tr><td>"+esc(g.name)+"</td><td class='num delta-up'>"+h(g.wasted)+"</td><td>"+
+      g.files.map(f=>"<div class='tip'>"+esc(f.path)+" ("+h(f.size)+")</div>").join("")+"</td></tr>";
+    },{name:g=>g.name,wasted:g=>g.wasted});
+  }
+  // 空文件夹(#2)
+  const ef=DATA.empty_folders||[];
+  if(ef.length){
+    html+="<h2 style='margin-top:18px'>空文件夹（"+ef.length+" 个）</h2>"+
+      "<div class='sub'>可安全删除；已排除系统/依赖目录。前 50 个：</div>"+
+      "<div style='max-height:260px;overflow-y:auto'><table><tbody>"+
+      ef.slice(0,50).map(p=>"<tr><td class='tip'>"+esc(p)+"</td></tr>").join("")+
+      "</tbody></table></div>";
   }
   document.getElementById("panel-dup").innerHTML=html;
   const tb=document.querySelector("#panel-dup .toolbar");
@@ -1171,13 +1652,51 @@ PANEL_JS += """
 // ================= 大文件 =================
 (function(){
   const rows=DATA.large_files||[];
+  // 类型聚类(#9)
+  const cl=DATA.large_clusters||[];
+  let clHTML="";
+  if(cl.length){
+    const max=cl[0].size||1;
+    clHTML="<h2 style='margin-top:4px'>按类型聚类</h2><div class='sub'>大文件的类型分布，定位"哪类东西最占空间"</div>"+
+    "<table style='max-width:640px'><thead><tr><th>类型</th><th>合计体积</th><th>文件数</th><th>占比</th></tr></thead><tbody>"+
+    cl.map(c=>"<tr><td>"+esc(c.type)+"</td><td class='num'>"+h(c.size)+"</td><td class='num'>"+c.files+
+    "</td><td><div class='bar' style='width:220px'><i style='width:"+Math.round(c.size/max*100)+"%;background:#1e3a8a'></i></div></td></tr>").join("")+
+    "</tbody></table>";
+  }
+  // 相似文件名序列(#9)
+  const se=DATA.serial_groups||[];
+  let seHTML="";
+  if(se.length){
+    seHTML="<h2 style='margin-top:18px'>相似文件名序列（≥3 个一组）</h2><div class='sub'>video_001/002… 这类连续文件，往往是成批素材</div>"+
+    "<table style='max-width:640px'><thead><tr><th>示例文件</th><th>数量</th><th>合计体积</th></tr></thead><tbody>"+
+    se.map(g=>"<tr><td class='tip'>"+esc(g.sample)+"</td><td class='num'>"+g.count+"</td><td class='num'>"+h(g.size)+"</td></tr>").join("")+
+    "</tbody></table>";
+  }
   document.getElementById("panel-large").innerHTML=
-    "<h2>大文件排行（≥ "+h(DATA.min_size)+"）</h2><div class='sub'>按体积排序；视频/安装包/虚拟机镜像往往是大头，确认无用后再删</div>"+
-    (rows.length?"<div class='toolbar'><input type='text' id='lg-q' placeholder='🔍 筛选路径...'></div>"+
-    tableHTML("lg",[["文件路径",""],["大小","size"],["最后修改","mtime"],["距今","days"]]):"<p class='tip'>没有找到符合条件的大文件（试试 --full 全盘扫描或调低 --min-size）</p>");
+    "<h2>大文件排行（≥ "+h(DATA.min_size)+"）</h2><div class='sub'>按体积排序；视频/安装包/虚拟机镜像往往是大头，确认无用后再删</div>"+clHTML+seHTML+
+    (rows.length?"<h2 style='margin-top:18px'>明细</h2><div class='toolbar'><input type='text' id='lg-q' placeholder='🔍 筛选路径...'></div>"+
+    tableHTML("lg",[["文件路径",""],["类型",""],["大小","size"],["最后修改","mtime"],["距今","days"]]):"<p class='tip'>没有找到符合条件的大文件（试试全盘扫描或调低 --min-size）</p>");
   if(rows.length)makeSortable("lg",rows.map(f=>({...f,days:Math.max(0,Math.floor((Date.now()/1000-f.mtime)/86400))})),f=>{
-    return "<tr><td>"+esc(f.path)+"</td><td class='num'>"+h(f.size)+"</td><td class='num'>"+dt(f.mtime)+"</td><td class='num'>"+f.days+" 天</td></tr>";
+    return "<tr><td>"+esc(f.path)+"</td><td>"+esc(f._type||"")+"</td><td class='num'>"+h(f.size)+"</td><td class='num'>"+dt(f.mtime)+"</td><td class='num'>"+f.days+" 天</td></tr>";
   },{size:f=>f.size,mtime:f=>f.mtime,days:f=>f.days});
+  // 补类型标记（cluster 函数没把类型写回每个文件）
+  const typeMap={};
+  (DATA.large_files||[]).forEach(f=>{
+    const ext=(f.path.split(".").pop()||"").toLowerCase();
+    const rules=[["视频",["mp4","mkv","avi","mov","wmv","flv","ts","m4v","rmvb"]],
+      ["安装包",["exe","msi","msix","apk"]],
+      ["压缩包",["zip","rar","7z","tar","gz","bz2","xz","iso"]],
+      ["虚拟机/镜像",["vhd","vhdx","vmdk","qcow2","img","dmg","wim"]],
+      ["数据库",["mdb","db","sqlite","mdf","ldf","ibd"]],
+      ["文档",["pdf","doc","docx","ppt","pptx","xls","xlsx","md","txt"]],
+      ["图片",["jpg","jpeg","png","gif","bmp","webp","heic","raw","psd","tif"]],
+      ["音频",["mp3","flac","wav","ape","m4a","ogg"]],
+      ["模型权重",["safetensors","bin","pt","pth","ckpt","gguf","onnx"]],
+      ["日志/转储",["log","dmp","dump","tmp"]]];
+    let t="其他";
+    for(const [n,exts] of rules){if(exts.includes(ext)){t=n;break;}}
+    typeMap[f.path]=t;});
+  const draw=window._drawLg;if(draw)draw();
 })();
 
 // ================= 文件夹 =================
@@ -1191,10 +1710,68 @@ PANEL_JS += """
     return "<tr><td>"+esc(f.path)+"</td><td class='num'>"+h(f.size)+"</td><td class='num'>"+f.files+"</td></tr>";
   },{size:f=>f.size,files:f=>f.files});
 })();
+
+// ================= 空间趋势(#7) =================
+(function(){
+  const t=DATA.trend||[];
+  const el=document.getElementById("panel-trend");
+  if(t.length<2){el.innerHTML="<h2>分区剩余空间趋势</h2><p class='tip'>仅 "+t.length+" 次扫描记录，下次扫描后会生成趋势折线图</p>";return;}
+  const W=980,Hh=340,padL=70,padR=20,padT=20,padB=60;
+  const roots=[...new Set(t.flatMap(x=>Object.keys(x.disks||{})))];
+  const colors=["#1e3a8a","#16a34a","#d97706","#7c3aed","#0891b2","#dc2626"];
+  const series=roots.map((r,i)=>({root:r,color:colors[i%colors.length],
+    pts:t.map((s,j)=>({j:j+1,v:(s.disks||{})[r],cur:!!s.current,
+      g:s.generated})).filter(p=>p.v!=null)}));
+  const allV=series.flatMap(s=>s.pts.map(p=>p.v));
+  const lo=Math.min(...allV),hi=Math.max(...allV);
+  const span=(hi-lo)||1;
+  const X=j=>padL+(j-1)*(W-padL-padR)/(t.length-1);
+  const Y=v=>padT+(Hh-padT-padB)*(1-(v-lo)/span);
+  let svg="<svg viewBox='0 0 "+W+" "+Hh+"' style='width:100%;max-width:"+W+"px'>";
+  for(let g=0;g<=4;g++){const v=lo+span*g/4,y=Y(v);
+    svg+="<line x1='"+padL+"' y1='"+y+"' x2='"+(W-padR)+"' y2='"+y+"' stroke='#e5e7eb'/>";
+    svg+="<text x='"+(padL-8)+"' y="+(y+4)+" text-anchor='end' font-size='11' fill='#6b7280'>"+h(v)+"</text>";}
+  series.forEach(s=>{
+    if(s.pts.length<2)return;
+    svg+="<polyline fill='none' stroke='"+s.color+"' stroke-width='2.5' points='"+
+      s.pts.map(p=>X(p.j)+","+Y(p.v)).join(" ")+"'/>";
+    s.pts.forEach(p=>{svg+="<circle cx='"+X(p.j)+"' cy='"+Y(p.v)+"' r='"+(p.cur?5:3.5)+
+      "' fill='"+(p.cur?s.color:"#fff")+"' stroke='"+s.color+"' stroke-width='2'><title>"+
+      esc(p.g)+" · "+s.root+" 剩余 "+h(p.v)+"</title></circle>";});
+  });
+  t.forEach((s,j)=>{if(t.length>8&&j%2)return;
+    svg+="<text x='"+X(j+1)+"' y='"+(Hh-38)+"' text-anchor='middle' font-size='10' fill='#6b7280'>"+
+      esc(String(s.generated||"").slice(2,10))+"</text>";});
+  svg+="</svg>";
+  let legend="<div style='display:flex;gap:16px;flex-wrap:wrap;margin:10px 0'>"+
+    series.map(s=>"<span style='font-size:13px'><span style='display:inline-block;width:12px;height:12px;border-radius:6px;background:"+s.color+";margin-right:6px;vertical-align:-1px'></span>"+esc(s.root)+"</span>").join("")+"</div>";
+  el.innerHTML="<h2>分区剩余空间趋势（近 "+t.length+" 次扫描）</h2>"+
+    "<div class='sub'>折线上升=释放了空间，下降=空间被占用；大圆点=本次扫描</div>"+legend+
+    "<div style='overflow-x:auto'>"+svg+"</div>";
+})();
+
+// ================= 清理历史(#4) =================
+(function(){
+  const recs=(DATA.clean_history||[]).slice().reverse();
+  const el=document.getElementById("panel-hist");
+  if(!recs.length){el.innerHTML="<h2>清理历史</h2><p class='tip'>还没有清理记录。在「清理点」或「项目依赖目录」页勾选项目并导出清理脚本，运行后这里会自动出现记录。</p>";return;}
+  const total=recs.reduce((s,r)=>s+(r.count||0),0);
+  let rows=recs.map(r=>"<tr><td class='num'>"+esc(r.time)+"</td><td class='num'>"+(r.count||0)+
+    "</td><td class='tip'>"+(r.paths||[]).slice(0,5).map(esc).join("<br>")+
+    ((r.paths||[]).length>5?"<br>… 共 "+r.paths.length+" 项":"")+"</td></tr>").join("");
+  el.innerHTML="<h2>清理历史（最近 "+recs.length+" 次）</h2>"+
+    "<div class='sub'>由导出的清理脚本自动记录；配合「空间趋势」页可验证清理效果。累计清理 "+total+" 项</div>"+
+    "<table><thead><tr><th>时间</th><th>项数</th><th>清理内容</th></tr></thead><tbody>"+rows+"</tbody></table>";
+})();
+
 """
 
 # ---------------------------------------------------------------- HTML 写出
 def write_html(data, outdir):
+    # 内嵌 exe/脚本路径，供导出的清理脚本回调记录清理历史
+    data = dict(data)
+    data["tool_path"] = os.path.abspath(sys.executable if getattr(sys, "frozen", False)
+                                        else os.path.abspath(__file__))
     head = HTML_HEAD.replace("__DATA__", json.dumps(data, ensure_ascii=False))
     html = head + PANEL_JS + HTML_TAIL
     path = os.path.join(outdir, "清理扫描报告.html")
@@ -1550,8 +2127,32 @@ def run_gui(args, cfg, report_root):
     Toggle(opt_card, "全盘扫描（所有硬盘，较慢）", full_var, width=S(210)).place(
         relx=0.025, rely=0.5, anchor="w")
     Toggle(opt_card, "检测重复文件", dup_var, width=S(150)).place(
-        relx=0.46, rely=0.5, anchor="w")
-    tk.Label(opt_card, text="默认只扫用户目录，更快", font=F_DETAIL,
+        relx=0.36, rely=0.5, anchor="w")
+
+    # 扫描范围多选（#12）：默认用户目录 / 指定盘符
+    avail_drives = [d for d in list_drives()] if IS_WIN else ["/"]
+    scan_scope_var = tk.StringVar(value="默认（用户目录）")
+    scope_menu = tk.OptionMenu(opt_card, scan_scope_var,
+                               "默认（用户目录）", *["%s 盘" % d[0] for d in avail_drives])
+    scope_menu.configure(font=F_DETAIL, bg=CARD, fg=TXT,
+                         activebackground="#232e6e", activeforeground=TXT,
+                         highlightthickness=0, bd=0, indicatoron=False,
+                         direction="below", padx=S(10), pady=S(6), cursor="hand2")
+    opt_card.menu = scope_menu["menu"]
+    opt_card.menu.configure(font=F_DETAIL, bg=CARD, fg=TXT,
+                            activebackground="#232e6e", activeforeground=TXT,
+                            tearoff=0)
+    tk.Label(opt_card, text="范围", font=F_DETAIL, bg=CARD, fg=DIM).place(
+        relx=0.60, rely=0.5, anchor="e")
+    scope_menu.place(relx=0.615, rely=0.5, anchor="w")
+
+    def scope_choice():
+        """返回传给 run_scan 的 drives 字符串（空=默认用户目录）"""
+        v = scan_scope_var.get()
+        if v.startswith("默认"):
+            return ""
+        return v[0]  # "C 盘" -> "C"
+    tk.Label(opt_card, text="勾选全盘时忽略范围选择", font=F_DETAIL,
              bg=CARD, fg=DIM).place(relx=0.975, rely=0.5, anchor="e")
 
     # 报告位置卡（点击打开 / 可切换 / 记住上次）
@@ -1711,7 +2312,7 @@ def run_gui(args, cfg, report_root):
         def work():
             try:
                 a = argparse.Namespace(
-                    full=full_var.get(), drives="", min_size=100 * 2**20,
+                    full=full_var.get(), drives=scope_choice(), min_size=100 * 2**20,
                     dup_min=10 * 2**20, no_duplicates=not dup_var.get(),
                     timeout=900, no_open=True, report_dir="",
                     set_report_dir="", reset_report_dir=False)
@@ -1874,9 +2475,59 @@ def run_gui(args, cfg, report_root):
     append_log("报告保存位置：%s（点击上方路径可打开文件夹，可「切换位置」）"
                % path_state["dir"])
     append_log("点击「开始扫描」开始，扫描过程中可实时观察 7 个阶段的进度。")
+
+    # ---- #14 距上次扫描提醒 ----
+    last_scan = cleanup_last_scan_time(path_state["dir"])
+    if last_scan:
+        try:
+            t = datetime.strptime(last_scan, "%Y-%m-%d %H:%M:%S")
+            gap = (datetime.now() - t).days
+            if gap >= 30:
+                append_log("⏰ 距上次扫描已 %d 天，建议做一次新的扫描。" % gap)
+            elif gap >= 7:
+                append_log("距上次扫描 %d 天（%s）。" % (gap, last_scan))
+        except ValueError:
+            pass
+    else:
+        append_log("这是首次扫描，完成后下次会自动生成历史对比与空间趋势。")
+
+    # ---- #13 后台检查 GitHub 新版本 ----
+    def check_update():
+        latest = check_github_latest()
+        if latest and version_gt(latest, APP_VERSION):
+            logq.put(("log", "🔔 发现新版本 v%s（当前 v%s），可到 %s 下载更新。"
+                      % (latest, APP_VERSION, RELEASES_URL)))
+    threading.Thread(target=check_update, daemon=True).start()
+
     poll_msg()
     on_tick()
     root.mainloop()
+
+
+# ---------------------------------------------------------------- 版本更新检查(#13)
+def check_github_latest(timeout=8):
+    """后台线程调用：返回最新版本号字符串，失败返回 None"""
+    try:
+        import urllib.request
+        req = urllib.request.Request(
+            "https://api.github.com/repos/%s/releases/latest" % GITHUB_REPO,
+            headers={"User-Agent": "pc-clean-scanner"})
+        # 尊重系统代理（无代理直连，国内环境由 Clash 等接管）
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            data = json.loads(r.read().decode("utf-8"))
+        return (data.get("tag_name") or "").lstrip("v") or None
+    except Exception:
+        return None
+
+
+def version_gt(a, b):
+    """比较两个 x.y.z 版本号，a>b 返回 True"""
+    try:
+        pa = [int(x) for x in a.split(".")]
+        pb = [int(x) for x in b.split(".")]
+        return pa > pb
+    except (ValueError, AttributeError):
+        return False
 
 
 # ---------------------------------------------------------------- main
@@ -1894,9 +2545,33 @@ def main():
     ap.add_argument("--reset-report-dir", action="store_true", help="恢复默认报告位置并退出")
     ap.add_argument("--console", action="store_true", help="强制控制台模式(不弹窗口)")
     ap.add_argument("--serve", action="store_true", help="扫描后启动手机查看服务")
+    ap.add_argument("--protect", default="", help="把路径加入保护名单(内部使用)")
+    ap.add_argument("--unprotect", default="", help="把路径移出保护名单(内部使用)")
+    ap.add_argument("--log-clean", default="", help="记录一次清理到清理历史(内部使用)")
     args = ap.parse_args()
 
     cfg = load_config()
+
+    # ---- 内部命令：保护名单 / 清理历史（由报告页与导出脚本调用）----
+    if args.protect:
+        p = os.path.abspath(args.protect)
+        paths = load_protected_paths()
+        if p not in paths:
+            paths.append(p)
+            save_protected_paths(paths)
+        print("protected: %s" % p)
+        return
+    if args.unprotect:
+        p = os.path.abspath(args.unprotect)
+        paths = [x for x in load_protected_paths() if x != p]
+        save_protected_paths(paths)
+        print("unprotected: %s" % p)
+        return
+    if args.log_clean:
+        paths = [x for x in args.log_clean.split("|") if x]
+        append_clean_history(paths)
+        print("logged: %d paths" % len(paths))
+        return
 
     if args.set_report_dir:
         d = os.path.abspath(os.path.expandvars(os.path.expanduser(args.set_report_dir)))
