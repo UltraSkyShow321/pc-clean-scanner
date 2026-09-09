@@ -61,7 +61,7 @@ DEFAULT_REPORT_DIR = os.path.join(SCRIPT_DIR, "scan_reports")
 LOG_FILE = os.path.join(SCRIPT_DIR, "扫描日志.log")
 
 FILE_ATTRIBUTE_REPARSE_POINT = 0x400
-APP_VERSION = "2.2.6"
+APP_VERSION = "2.2.7"
 GITHUB_REPO = "UltraSkyShow321/pc-clean-scanner"
 RELEASES_URL = "https://github.com/%s/releases" % GITHUB_REPO
 LEVEL_INFO = {
@@ -2379,6 +2379,10 @@ def run_gui(args, cfg, report_root):
         opt_rroot = path_state["dir"]
 
         def work():
+            # LOG/PROGRESS_HOOK 是全局变量；finally 里对它们赋值，
+            # 没有 global 声明时 Python 会把 LOG 当局部变量，
+            # 前面读取时触发 UnboundLocalError（扫描完成后收尾崩溃）
+            global LOG, PROGRESS_HOOK
             try:
                 a = argparse.Namespace(
                     full=opt_full, drives=opt_drives, min_size=100 * 2**20,
