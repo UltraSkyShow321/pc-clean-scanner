@@ -61,7 +61,7 @@ DEFAULT_REPORT_DIR = os.path.join(SCRIPT_DIR, "scan_reports")
 LOG_FILE = os.path.join(SCRIPT_DIR, "扫描日志.log")
 
 FILE_ATTRIBUTE_REPARSE_POINT = 0x400
-APP_VERSION = "2.2.5"
+APP_VERSION = "2.2.6"
 GITHUB_REPO = "UltraSkyShow321/pc-clean-scanner"
 RELEASES_URL = "https://github.com/%s/releases" % GITHUB_REPO
 LEVEL_INFO = {
@@ -1860,6 +1860,7 @@ def run_gui(args, cfg, report_root):
     ACCENT = "#6d7bff"   # 主强调（蓝紫）
     CYAN = "#4dd6ff"     # 次强调（青）
     GREEN = "#3ddc97"
+    AMBER = "#ffc35c"
     RED = "#ff6b81"
 
     root = tk.Tk()
@@ -1979,8 +1980,12 @@ def run_gui(args, cfg, report_root):
             if self._en:
                 try:
                     self._cmd()
-                except Exception:
-                    pass
+                except Exception as e:
+                    import traceback
+                    try:
+                        LOG("按钮执行异常: %s" % traceback.format_exc())
+                    except Exception:
+                        pass
 
         def _enter(self, v):
             self._hov = v
