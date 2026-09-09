@@ -61,7 +61,7 @@ DEFAULT_REPORT_DIR = os.path.join(SCRIPT_DIR, "scan_reports")
 LOG_FILE = os.path.join(SCRIPT_DIR, "扫描日志.log")
 
 FILE_ATTRIBUTE_REPARSE_POINT = 0x400
-APP_VERSION = "2.2.3"
+APP_VERSION = "2.2.4"
 GITHUB_REPO = "UltraSkyShow321/pc-clean-scanner"
 RELEASES_URL = "https://github.com/%s/releases" % GITHUB_REPO
 LEVEL_INFO = {
@@ -383,15 +383,21 @@ DEPEND_DIR_NAMES = {"node_modules", "venv", ".venv", "target", "__pycache__",
 
 # ---------------------------------------------------------------- 盘符
 def list_drives():
+    """枚举本地固定硬盘。关键：不能用 GetDriveTypeW——它遇到断开/不可达的
+    网络映射盘会尝试重新连接 SMB，阻塞数十秒到数分钟且无任何提示。
+    QueryDosDeviceW 只查内核设备名，不触碰网络，永远立即返回。
+    本地硬盘的设备名以 \\Device\\Harddisk 开头；网络盘是 LanmanRedirector 等。"""
     drives = []
     if IS_WIN:
         bitmask = ctypes.windll.kernel32.GetLogicalDrives()
         for i, letter in enumerate(string.ascii_uppercase):
             if bitmask & (1 << i):
-                root = "%s:\\" % letter
-                dtype = ctypes.windll.kernel32.GetDriveTypeW(root)
-                if dtype == 3:  # 3 = DRIVE_FIXED 本地硬盘
-                    drives.append(root)
+                root = "%s:" % letter
+                buf = ctypes.create_unicode_buffer(512)
+                n = ctypes.windll.kernel32.QueryDosDeviceW(root, buf, 512)
+                target = buf.value if n else ""
+                if target.startswith("\\Device\\Harddisk"):
+                    drives.append(root + "\\")
     else:
         drives = ["/"]
     return drives
@@ -1044,7 +1050,12 @@ def scan_roots_for(args, drives, home):
 def run_scan(args, report_root):
     t0 = time.time()
     home = os.path.expanduser("~")
+    # 第一时间输出日志：让用户立刻看到扫描已启动（此前磁盘枚举是静默期）
+    LOG("开始扫描 · 模式：%s" % ("全盘扫描" if args.full else
+        ("指定盘符: " + args.drives if getattr(args, "drives", "") else "快速扫描(用户目录)")))
+    _prog(1, -1, "正在识别本地硬盘 ...")
     drives = list_drives()
+    LOG("    识别到本地硬盘: %s" % ", ".join(drives))
     system_drive = "C:\\" if IS_WIN else "/"
     is_admin = False
     if IS_WIN:
