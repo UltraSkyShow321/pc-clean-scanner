@@ -61,7 +61,7 @@ DEFAULT_REPORT_DIR = os.path.join(SCRIPT_DIR, "scan_reports")
 LOG_FILE = os.path.join(SCRIPT_DIR, "扫描日志.log")
 
 FILE_ATTRIBUTE_REPARSE_POINT = 0x400
-APP_VERSION = "2.2.4"
+APP_VERSION = "2.2.5"
 GITHUB_REPO = "UltraSkyShow321/pc-clean-scanner"
 RELEASES_URL = "https://github.com/%s/releases" % GITHUB_REPO
 LEVEL_INFO = {
@@ -2366,14 +2366,21 @@ def run_gui(args, cfg, report_root):
 
         PROGRESS_HOOK = hook
 
+        # Tkinter 非线程安全：所有 Tk 变量必须在主线程读取完毕，
+        # 后台线程只使用普通 Python 值（跨线程 .get() 会死锁，表现为进度恒 0、日志无输出）
+        opt_full = full_var.get()
+        opt_dup = dup_var.get()
+        opt_drives = scope_choice()
+        opt_rroot = path_state["dir"]
+
         def work():
             try:
                 a = argparse.Namespace(
-                    full=full_var.get(), drives=scope_choice(), min_size=100 * 2**20,
-                    dup_min=10 * 2**20, no_duplicates=not dup_var.get(),
+                    full=opt_full, drives=opt_drives, min_size=100 * 2**20,
+                    dup_min=10 * 2**20, no_duplicates=not opt_dup,
                     timeout=900, no_open=True, report_dir="",
                     set_report_dir="", reset_report_dir=False)
-                rroot = path_state["dir"]
+                rroot = opt_rroot
                 data = run_scan(a, rroot)
                 stamp = datetime.now().strftime("%Y%m%d_%H%M")
                 outdir = os.path.join(rroot, stamp)
