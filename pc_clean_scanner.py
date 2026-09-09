@@ -61,7 +61,7 @@ DEFAULT_REPORT_DIR = os.path.join(SCRIPT_DIR, "scan_reports")
 LOG_FILE = os.path.join(SCRIPT_DIR, "扫描日志.log")
 
 FILE_ATTRIBUTE_REPARSE_POINT = 0x400
-APP_VERSION = "2.2.2"
+APP_VERSION = "2.2.3"
 GITHUB_REPO = "UltraSkyShow321/pc-clean-scanner"
 RELEASES_URL = "https://github.com/%s/releases" % GITHUB_REPO
 LEVEL_INFO = {
@@ -1867,16 +1867,17 @@ def run_gui(args, cfg, report_root):
              "server": None, "url": None}
     logq = queue_mod.Queue()
 
+    # 字体用负数像素字号（Tk 中负值=像素）：随 DPI 精确缩放，不会双重放大导致重叠
     F_TITLE = tkfont.Font(root, family="Microsoft YaHei UI",
-                          size=S(18), weight="bold")
-    F_SUB = tkfont.Font(root, family="Microsoft YaHei UI", size=S(10))
-    F_UI = tkfont.Font(root, family="Microsoft YaHei UI", size=S(10))
-    F_UIB = tkfont.Font(root, family="Microsoft YaHei UI", size=S(10), weight="bold")
-    F_BTN = tkfont.Font(root, family="Microsoft YaHei UI", size=S(11), weight="bold")
-    F_STAGE = tkfont.Font(root, family="Microsoft YaHei UI", size=S(10), weight="bold")
-    F_DETAIL = tkfont.Font(root, family="Microsoft YaHei UI", size=S(9))
-    F_LOG = tkfont.Font(root, family="Consolas", size=S(9))
-    F_CHIP = tkfont.Font(root, family="Microsoft YaHei UI", size=S(8))
+                          size=-S(26), weight="bold")
+    F_SUB = tkfont.Font(root, family="Microsoft YaHei UI", size=-S(14))
+    F_UI = tkfont.Font(root, family="Microsoft YaHei UI", size=-S(14))
+    F_UIB = tkfont.Font(root, family="Microsoft YaHei UI", size=-S(14), weight="bold")
+    F_BTN = tkfont.Font(root, family="Microsoft YaHei UI", size=-S(15), weight="bold")
+    F_STAGE = tkfont.Font(root, family="Microsoft YaHei UI", size=-S(14), weight="bold")
+    F_DETAIL = tkfont.Font(root, family="Microsoft YaHei UI", size=-S(12))
+    F_LOG = tkfont.Font(root, family="Consolas", size=-S(12))
+    F_CHIP = tkfont.Font(root, family="Microsoft YaHei UI", size=-S(11))
 
     def round_pts(x1, y1, x2, y2, r):
         return [x1 + r, y1, x2 - r, y1, x2, y1, x2, y1 + r, x2, y2 - r,
@@ -1888,13 +1889,13 @@ def run_gui(args, cfg, report_root):
         return s if len(s) <= n else s[:n - 26] + "…" + s[-20:]
 
     # ---------------- 顶部 hero：渐变 + 液态光斑 ----------------
-    hero = tk.Canvas(root, height=S(96), bg=BG0, highlightthickness=0)
+    hero = tk.Canvas(root, height=S(104), bg=BG0, highlightthickness=0)
     hero.pack(fill="x")
 
     def draw_hero(e=None):
         hero.delete("all")
         w = max(hero.winfo_width(), S(300))
-        h = S(96)
+        h = int(hero["height"])
         n = 48
         for i in range(n):
             t = i / n
@@ -1905,9 +1906,17 @@ def run_gui(args, cfg, report_root):
                                      (w * 0.46, -S(6), S(160), S(52), "#1b2547")]:
             hero.create_oval(cx - rx, cy - ry, cx + rx, cy + ry, fill=col,
                              outline="", stipple="gray50")
-        hero.create_text(S(28), S(36), anchor="w", text="电脑清理扫描器",
+        # 用字体实测行高排版，任何 DPI 下都不会重叠
+        tl = F_TITLE.metrics("linespace")
+        sl = F_SUB.metrics("linespace")
+        y_title = S(14) + tl // 2
+        y_sub = y_title + tl // 2 + sl // 2 + S(2)
+        if y_sub + sl // 2 > h:  # 视高度不够则整体上移
+            y_title = max(S(8), y_title - (y_sub + sl // 2 - h + S(4)))
+            y_sub = y_title + tl // 2 + sl // 2 + S(2)
+        hero.create_text(S(28), y_title, anchor="w", text="电脑清理扫描器",
                          font=F_TITLE, fill=TXT)
-        hero.create_text(S(30), S(68), anchor="w",
+        hero.create_text(S(30), y_sub, anchor="w",
                          text="只扫描、只出报告，绝不删除 · 报告位置可切换 · 实时进度",
                          font=F_SUB, fill=DIM)
     hero.bind("<Configure>", draw_hero)
@@ -1917,8 +1926,10 @@ def run_gui(args, cfg, report_root):
     class Card(tk.Frame):
         def __init__(self, master):
             super().__init__(master, bg=BG0)
+            # 背景画布用 place 铺满，不占用 pack 空间，
+            # 后续 pack 进来的内容控件不会被挤成 1x1
             self.cv = tk.Canvas(self, bg=BG0, highlightthickness=0)
-            self.cv.pack(fill="both", expand=True)
+            self.cv.place(relx=0, rely=0, relwidth=1, relheight=1)
             self.cv.bind("<Configure>", lambda e: self._redraw())
 
         def _redraw(self):
@@ -1987,7 +1998,7 @@ def run_gui(args, cfg, report_root):
                 self.create_text(w / 2, h / 2 + 1, text=self._t, font=F_BTN, fill=tc)
             else:
                 fill = "#263257" if self._hov else "#1c2647"
-                tc = TXT if self._en else "#7f89ad"
+                tc = ("#f4f7ff" if self._hov else "#d7def5") if self._en else "#7f89ad"
                 self.create_polygon(round_pts(1, 1, w - 2, h - 2, r), smooth=True,
                                     fill=fill, outline=EDGE)
                 self.create_text(w / 2, h / 2 + 1, text=self._t, font=F_UIB, fill=tc)
@@ -2098,20 +2109,19 @@ def run_gui(args, cfg, report_root):
         def redraw(self):
             self.delete("all")
             w = self.winfo_width()
+            h = int(self["height"])
             if w < S(140):
                 return
             cw = w / 7.0
-            # 按芯片宽度自适应缩放文字，避免溢出
+            # 按字体实测行高排版，避免重叠
             f_num = F_CHIP
             f_name = F_CHIP
-            avail = cw - S(14)
-            if avail < S(58):
-                f_num = tkfont.Font(root=root, family="Microsoft YaHei UI",
-                                    size=max(7, S(7)))
-                f_name = f_num
+            num_ls = tkfont.Font(font=f_num).metrics("linespace")
+            name_ls = tkfont.Font(font=f_name).metrics("linespace")
+            avail = cw - S(12)
             for i in range(7):
-                x1 = i * cw + S(4)
-                x2 = (i + 1) * cw - S(4)
+                x1 = i * cw + S(3)
+                x2 = (i + 1) * cw - S(3)
                 st = i + 1
                 if st in self.done:
                     fill, edge, tc = "#11322a", "#1f7a5c", GREEN
@@ -2119,16 +2129,20 @@ def run_gui(args, cfg, report_root):
                     fill, edge, tc = "#232e6e", ACCENT, TXT
                 else:
                     fill, edge, tc = "#121a33", "#28325a", DIM
-                self.create_polygon(round_pts(x1, S(3), x2, S(49), S(10)),
+                self.create_polygon(round_pts(x1, S(2), x2, h - S(2), S(10)),
                                     smooth=True, fill=fill, outline=edge)
                 cx = (x1 + x2) / 2
-                self.create_text(cx, S(15), text=("✓" if st in self.done else str(st)),
+                total = num_ls + name_ls + S(6)
+                y0 = max(S(4), (h - total) / 2)
+                self.create_text(cx, y0 + num_ls / 2,
+                                 text=("✓" if st in self.done else str(st)),
                                  font=f_num, fill=tc)
                 name = CHIP_NAMES[i]
-                # 名字超宽时缩到两个点
+                # 名字超宽时才逐字截断（正常宽度下显示完整）
                 while name and tkfont.Font(font=f_name).measure(name) > avail:
                     name = name[:-1]
-                self.create_text(cx, S(33), text=name, font=f_name, fill=tc)
+                self.create_text(cx, y0 + num_ls + S(6) + name_ls / 2,
+                                 text=name, font=f_name, fill=tc)
 
     # ---------------- 布局 ----------------
     content = tk.Frame(root, bg=BG0)
@@ -2503,7 +2517,7 @@ def run_gui(args, cfg, report_root):
     open_btn._cmd = open_report
     phone_btn._cmd = phone_view
     root.protocol("WM_DELETE_WINDOW", on_close)
-    append_log("欢迎使用电脑清理扫描器 v2.1 —— 只扫描、只出报告，绝不删除。")
+    append_log("欢迎使用电脑清理扫描器 v%s —— 只扫描、只出报告，绝不删除。" % APP_VERSION)
     append_log("报告保存位置：%s（点击上方路径可打开文件夹，可「切换位置」）"
                % path_state["dir"])
     append_log("点击「开始扫描」开始，扫描过程中可实时观察 7 个阶段的进度。")
