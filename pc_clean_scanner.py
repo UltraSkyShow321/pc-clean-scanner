@@ -61,7 +61,7 @@ DEFAULT_REPORT_DIR = os.path.join(SCRIPT_DIR, "scan_reports")
 LOG_FILE = os.path.join(SCRIPT_DIR, "扫描日志.log")
 
 FILE_ATTRIBUTE_REPARSE_POINT = 0x400
-APP_VERSION = "2.2.7"
+APP_VERSION = "2.2.8"
 GITHUB_REPO = "UltraSkyShow321/pc-clean-scanner"
 RELEASES_URL = "https://github.com/%s/releases" % GITHUB_REPO
 LEVEL_INFO = {
@@ -1390,7 +1390,7 @@ HTML_TAIL = """
 </html>
 """
 
-PANEL_JS = """
+PANEL_JS = r"""
 // ================= 通用：可排序表格 =================
 function makeSortable(tbodyId, rows, render, sortKeys){
   // rows: 对象数组; render(obj)->tr html; sortKeys: {列名: 取值函数}
@@ -1584,7 +1584,7 @@ function toast(msg){
   clearTimeout(t._h);t._h=setTimeout(()=>{t.style.display="none"},2600);
 }
 """
-PANEL_JS += """
+PANEL_JS += r"""
 // ================= 重复文件 =================
 (function(){
   const rows=DATA.duplicates||[];
@@ -1593,16 +1593,8 @@ PANEL_JS += """
     rows.length+" 组，重复占用约 <b>"+h(wasted)+"</b></div>";
   if(!rows.length){html+="<p class='tip'>没有发现大体积重复文件（门槛 ≥ "+h(DATA.dup_min)+"）</p>";}
   else{
-    const markTag=m=>m==="keep"?"<span style='color:#16a34a;font-weight:600'>✔ 保留:</span>":
-      m==="drop"?"<span style='color:#dc2626;font-weight:600'>🗑 删除:</span>":
-      "<span style='color:#6b7280'>↳ 副本:</span>";
     html+="<div class='toolbar'><input type='text' id='dup-q' placeholder='🔍 筛选路径...'></div>"+
     tableHTML("dup",[["组","gi"],["单个体积","size"],["重复浪费","wasted"],["文件列表(含保留建议)",""]]);
-    makeSortable("dup",rows.map((g,i)=>({...g,gi:i+1})),g=>{
-      const marks=g.marks||g.files.map((_,i)=>i?"drop":"keep");
-      return "<tr><td class='num'>"+g.gi+"</td><td class='num'>"+h(g.size)+"</td><td class='num delta-up'>"+h(g.wasted)+
-      "</td><td>"+g.files.map((f,i)=>"<div class='"+(i?"tip":"")+"'>"+markTag(marks[i])+" "+esc(f)+"</div>").join("")+"</td></tr>";
-    },{gi:g=>g.gi,size:g=>g.size,wasted:g=>g.wasted});
   }
   // 同名不同位置的大文件(#2)
   const sn=DATA.same_name||[];
@@ -1610,10 +1602,6 @@ PANEL_JS += """
     html+="<h2 style='margin-top:18px'>同名文件（不同位置，疑似多份拷贝）</h2>"+
       "<div class='sub'>名字相同但内容未必相同，删除前请自行比对</div>"+
       tableHTML("sn",[["文件名","name"],["重复浪费","wasted"],["位置列表",""]]);
-    makeSortable("sn",sn,g=>{
-      return "<tr><td>"+esc(g.name)+"</td><td class='num delta-up'>"+h(g.wasted)+"</td><td>"+
-      g.files.map(f=>"<div class='tip'>"+esc(f.path)+" ("+h(f.size)+")</div>").join("")+"</td></tr>";
-    },{name:g=>g.name,wasted:g=>g.wasted});
   }
   // 空文件夹(#2)
   const ef=DATA.empty_folders||[];
@@ -1625,9 +1613,23 @@ PANEL_JS += """
       "</tbody></table></div>";
   }
   document.getElementById("panel-dup").innerHTML=html;
-  const tb=document.querySelector("#panel-dup .toolbar");
-  if(tb){const q=document.createElement("input");q.type="text";q.id="dup-q";q.placeholder="🔍 筛选路径...";
-    tb.appendChild(q);const d=window._drawDup;}
+  // 表格必须先插入 DOM，再初始化排序/筛选（thead 元素此时才存在）
+  if(rows.length){
+    const markTag=m=>m==="keep"?"<span style='color:#16a34a;font-weight:600'>✔ 保留:</span>":
+      m==="drop"?"<span style='color:#dc2626;font-weight:600'>🗑 删除:</span>":
+      "<span style='color:#6b7280'>↳ 副本:</span>";
+    makeSortable("dup",rows.map((g,i)=>({...g,gi:i+1})),g=>{
+      const marks=g.marks||g.files.map((_,i)=>i?"drop":"keep");
+      return "<tr><td class='num'>"+g.gi+"</td><td class='num'>"+h(g.size)+"</td><td class='num delta-up'>"+h(g.wasted)+
+      "</td><td>"+g.files.map((f,i)=>"<div class='"+(i?"tip":"")+"'>"+markTag(marks[i])+" "+esc(f)+"</div>").join("")+"</td></tr>";
+    },{gi:g=>g.gi,size:g=>g.size,wasted:g=>g.wasted});
+  }
+  if(sn.length){
+    makeSortable("sn",sn,g=>{
+      return "<tr><td>"+esc(g.name)+"</td><td class='num delta-up'>"+h(g.wasted)+"</td><td>"+
+      g.files.map(f=>"<div class='tip'>"+esc(f.path)+" ("+h(f.size)+")</div>").join("")+"</td></tr>";
+    },{name:g=>g.name,wasted:g=>g.wasted});
+  }
 })();
 
 // ================= 项目依赖目录 =================
@@ -1639,12 +1641,14 @@ PANEL_JS += """
   if(!rows.length){html+="<p class='tip'>没有扫描到项目依赖目录</p>";}
   else{
     html+="<div class='toolbar'></div>"+tableHTML("dep",[["路径",""],["类型","kind"],["体积","size"],["文件数","files"],["",""]]);
+  }
+  document.getElementById("panel-dep").innerHTML=html;
+  if(rows.length){
     makeSortable("dep",rows,d=>{
       return "<tr><td>"+esc(d.path)+"</td><td><code>"+esc(d.kind)+"</code></td><td class='num'>"+h(d.size)+
       "</td><td class='num'>"+d.files+"</td><td>"+chkBox("dep",d.path)+"</td></tr>";
     },{kind:d=>d.kind,size:d=>d.size,files:d=>d.files});
   }
-  document.getElementById("panel-dep").innerHTML=html;
 })();
 
 // ================= 程序 =================
@@ -1668,7 +1672,7 @@ PANEL_JS += """
   let clHTML="";
   if(cl.length){
     const max=cl[0].size||1;
-    clHTML="<h2 style='margin-top:4px'>按类型聚类</h2><div class='sub'>大文件的类型分布，定位"哪类东西最占空间"</div>"+
+    clHTML="<h2 style='margin-top:4px'>按类型聚类</h2><div class='sub'>大文件的类型分布，定位“哪类东西最占空间”</div>"+
     "<table style='max-width:640px'><thead><tr><th>类型</th><th>合计体积</th><th>文件数</th><th>占比</th></tr></thead><tbody>"+
     cl.map(c=>"<tr><td>"+esc(c.type)+"</td><td class='num'>"+h(c.size)+"</td><td class='num'>"+c.files+
     "</td><td><div class='bar' style='width:220px'><i style='width:"+Math.round(c.size/max*100)+"%;background:#1e3a8a'></i></div></td></tr>").join("")+
@@ -1714,7 +1718,7 @@ PANEL_JS += """
 (function(){
   const rows=DATA.folders||[];
   document.getElementById("panel-folders").innerHTML=
-    "<h2>文件夹体积排行</h2><div class='sub'>扫描顶层目录（深度 4 层），用于定位"空间都去哪了"</div>"+
+    "<h2>文件夹体积排行</h2><div class='sub'>扫描顶层目录（深度 4 层），用于定位“空间都去哪了”</div>"+
     (rows.length?"<div class='toolbar'><input type='text' id='fd-q' placeholder='🔍 筛选路径...'></div>"+
     tableHTML("fd",[["路径",""],["体积","size"],["文件数","files"]]):"<p class='tip'>无数据</p>");
   if(rows.length)makeSortable("fd",rows,f=>{
